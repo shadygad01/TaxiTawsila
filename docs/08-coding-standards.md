@@ -66,7 +66,10 @@ Every PR must confirm:
 - [ ] Audit logging added for any new admin-mutating action.
 - [ ] No new pay-per-request third-party dependency introduced without an ADR (Cost Strategy).
 - [ ] **New computed value that feeds a downstream decision (fare, trust, quality, reward) has a provenance column and is logged in `platform.provenance_log`** (ADR-0022) — no exceptions without an explicit reviewer sign-off explaining why the value doesn't need reproducibility.
-- [ ] **New business-rule config value is added as a versioned aggregate following the ADR-0017 shape** (append-only, `status`, `effective_from`, `rolled_back_from`, audit-logged), never as a mutable single-row setting.
+- [ ] **New business-rule config value is added as a versioned aggregate following the ADR-0017 shape** (append-only, `status`, `effective_from`, `rolled_back_from`, audit-logged), never as a mutable single-row setting. If it's a fraud/quality/trust-relevant threshold, it's designated **high-risk** and gets the `PENDING_APPROVAL` dual-control step (ADR-0026), not the plain `DRAFT`/`ACTIVE` flow.
+- [ ] **(added, Pre-Implementation Audit §3) Any change to `TrustSignalEvaluator`/`DataQualityComponentEvaluator` scoring logic bumps `engine_version`** — CI fails the PR if scoring-logic files changed without a corresponding version bump; the entire reproducibility promise (ADR-0022) depends on this discipline being enforced, not remembered.
+- [ ] **(added, Pre-Implementation Audit §2) New domain event published via the outbox has an explicit `event_version`, a `correlationId` sourced from the request context, and a named, idempotent consumer registered in `platform.event_consumption_log`** (ADR-0023) — never deduplicated on `(event_type, aggregate_id)` alone.
+- [ ] **(added, Pre-Implementation Audit §8) No new numeric/timing constant that reads like a business rule is hardcoded in prose, an ADR, or application code** (e.g., a cadence, a batch size, a threshold) — it belongs in a versioned config aggregate (ADR-0017) unless it's a pure infra/ops setting (e.g., a cache TTL), in which case it's an environment variable, not a literal.
 
 ## 9. Testing Conventions
 

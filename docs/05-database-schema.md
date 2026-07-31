@@ -39,25 +39,64 @@ CREATE SCHEMA IF NOT EXISTS admin;
 CREATE SCHEMA IF NOT EXISTS platform;
 ```
 
-### 1.1 Transactional Outbox & Provenance Log (`platform` schema — ADR-0011, ADR-0022)
+### 1.1 Transactional Outbox, Dead Letter, Event Consumption Log & Provenance Log (`platform` schema — ADR-0011, ADR-0022, revised by ADR-0023/ADR-0024 after the Pre-Implementation Audit)
 
-Every module that publishes a domain event writes it here, in the **same transaction** as the state change that produced it. A relay worker polls `dispatched_at IS NULL ORDER BY created_at`, delivers to consumers, and marks rows dispatched — in-process at MVP, swappable for a real broker/CDC relay later without changing this table's contract.
+Every module that publishes a domain event writes it here, in the **same transaction** as the state change that produced it. A relay worker (or, at scale, a pool of workers claiming disjoint `aggregate_id` hash-bucket partitions — ADR-0023) polls `dispatched_at IS NULL ORDER BY created_at` within its partition, delivers to consumers, and marks rows dispatched — in-process at MVP, swappable for a real broker/CDC relay later without changing this table's contract.
 
 ```sql
+-- REVISED (ADR-0023): event_version added (schema-version discipline for payload shape changes,
+-- mirroring config versioning applied to event shapes) and correlation_id added (ADR-0027,
+-- end-to-end trace/log correlation across the async Trip -> {Trust, DataQuality} -> Reward chain).
 CREATE TABLE platform.outbox (
-    id             BIGSERIAL PRIMARY KEY,
-    event_type     TEXT NOT NULL,          -- e.g. 'TripCompleted', 'TripVerified', 'DataQualityAssessed'
-    aggregate_type TEXT NOT NULL,          -- e.g. 'Trip'
-    aggregate_id   UUID NOT NULL,
-    payload        JSONB NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    dispatched_at  TIMESTAMPTZ,
-    attempts       INT NOT NULL DEFAULT 0
+    id              BIGSERIAL PRIMARY KEY,
+    event_type      TEXT NOT NULL,          -- e.g. 'TripCompleted', 'TripVerified', 'DataQualityAssessed'
+    event_version   INT NOT NULL DEFAULT 1,
+    aggregate_type  TEXT NOT NULL,          -- e.g. 'Trip'
+    aggregate_id    UUID NOT NULL,
+    correlation_id  UUID NOT NULL,          -- propagated from the originating request's trace context
+    payload         JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    dispatched_at   TIMESTAMPTZ,
+    attempts        INT NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_outbox_undispatched ON platform.outbox (created_at) WHERE dispatched_at IS NULL;
+CREATE INDEX idx_outbox_aggregate ON platform.outbox (aggregate_id, created_at);
+CREATE INDEX idx_outbox_correlation ON platform.outbox (correlation_id);
+
+-- NEW (ADR-0024): rows that exceeded max_attempts move here — a defined, visible failure mode
+-- instead of infinite silent retry or an undefined drop. max_attempts default is platform-wide,
+-- overridable per event_type via config.rate_limit_config-style admin tuning if needed.
+CREATE TABLE platform.outbox_dead_letter (
+    id               BIGSERIAL PRIMARY KEY,
+    original_outbox_id BIGINT NOT NULL,
+    event_type       TEXT NOT NULL,
+    event_version    INT NOT NULL,
+    aggregate_type   TEXT NOT NULL,
+    aggregate_id     UUID NOT NULL,
+    correlation_id   UUID NOT NULL,
+    payload          JSONB NOT NULL,
+    total_attempts   INT NOT NULL,
+    last_error       TEXT,
+    failed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    requeued_at      TIMESTAMPTZ,
+    requeued_by_admin_id UUID REFERENCES admin.admin_user(id)
+);
+CREATE INDEX idx_dead_letter_unresolved ON platform.outbox_dead_letter (failed_at) WHERE requeued_at IS NULL;
+
+-- NEW (ADR-0023): the corrected idempotency mechanism. Keyed on the outbox row's OWN unique id,
+-- never on (event_type, aggregate_id) -- the latter would wrongly treat a second, legitimate
+-- event for the same aggregate (e.g. a post-CORRECTED DataQualityAssessed re-assessment) as a
+-- duplicate of the first. Also the mechanism that makes replay-after-backup-restore safe: a
+-- restored row that was already processed before the backup is recognized here and skipped.
+CREATE TABLE platform.event_consumption_log (
+    consumer_name    TEXT NOT NULL,     -- e.g. 'trust-engine', 'data-quality-engine', 'reward-engine'
+    outbox_event_id  BIGINT NOT NULL,
+    processed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer_name, outbox_event_id)
+);
 ```
 
-Consumers must be idempotent per `(event_type, aggregate_id)` since delivery is at-least-once. **`TripCompleted` now fans out to two independent consumers — Trust and Data Quality (ADR-0019) — both idempotent, neither blocking the other.**
+**Consumers are idempotent per `(consumer_name, outbox_event_id)`** (ADR-0023) — never per `(event_type, aggregate_id)`. `TripCompleted` fans out to two independent consumers — Trust and Data Quality (ADR-0019) — each with its own row in `event_consumption_log`, neither blocking the other.
 
 **Provenance log (added, ADR-0022):** every write or correction of a provenance-bearing value (estimated fare, traffic estimate, trust score, data quality score, reward grant) is additionally recorded here, so a value's full history survives even a later Manual Review "Corrected" action — the inline JSONB provenance column on each table only ever holds the *current* provenance, this table holds all of them.
 
@@ -74,9 +113,13 @@ CREATE TABLE platform.provenance_log (
 CREATE INDEX idx_provenance_entity ON platform.provenance_log (entity_type, entity_id);
 ```
 
+**Partitioning (revised, Pre-Implementation Audit §3):** `platform.outbox` and `platform.provenance_log` are the two highest-write-frequency tables added since `gps_ping` received its partitioning decision (ADR-0015) — every trip completion alone writes 3–4 outbox rows and a provenance_log row per corrected/re-estimated field. Applying the same lesson: both are monthly-range-partitioned on `created_at`/`recorded_at` from their first migration, not deferred. `platform.event_consumption_log` and `platform.outbox_dead_letter` are lower-volume (one row per successful consumption, or per genuinely-failed event respectively) and remain partition-ready but not partitioned at MVP. `feature.feature_exposure_log`, `dataquality.data_review_case_event`, `advertising.ad_impression`, and `advertising.ad_click` are likewise partition-ready (natural key: `created_at`/`served_at`) but do not need day-one partitioning at MVP volume — revisit per the same capacity-milestone discipline as the Scalability Plan already applies elsewhere.
+
 ## 2. `config` Schema (Configuration Platform)
 
-Every aggregate here follows the same versioned shape (ADR-0017): append-only, `status` (`DRAFT`/`ACTIVE`/`SUPERSEDED`), `effective_from`-resolved "current" version, every publish audit-logged via `admin.audit_log_entry`, rollback modeled as a new version copying a prior one's values (`rolled_back_from`).
+Every aggregate here follows the same versioned shape (ADR-0017): append-only, `status` (`DRAFT`/`ACTIVE`/`SUPERSEDED`), `effective_from`-resolved "current" version, every publish audit-logged via `admin.audit_log_entry`, rollback modeled as a new version copying a prior one's values (`rolled_back_from`). **Resolution tie-break (added, Pre-Implementation Audit §6):** "current effective version" is always resolved via `ORDER BY effective_from DESC, created_at DESC LIMIT 1` — the `created_at` tie-break handles the edge case of two versions sharing an identical `effective_from` (near-simultaneous publishes), which was previously unspecified.
+
+**High-risk aggregates and dual control (added, ADR-0026):** `trust_threshold_config`, `fraud_threshold_config`, `gps_threshold_config`, and `data_quality_threshold_config` are designated **high-risk** — misconfiguring any of them directly weakens fraud/quality protection. Their `status` enum gains an intermediate value: `DRAFT → PENDING_APPROVAL → ACTIVE → SUPERSEDED`, and they carry an `approved_by_admin_id` column that must reference an admin **other than** `created_by_admin_id` before the row can become `ACTIVE` — enforced at the application layer (the DB constraint alone can't express "different admin," but the column existing is what the application layer checks against). Non-high-risk config (`reward_rule_config`, `advertising_target_config`, `rate_limit_config`) keeps the simpler `DRAFT → ACTIVE → SUPERSEDED` flow from ADR-0017 unchanged — dual control is reserved for what actually needs it.
 
 ```sql
 CREATE TABLE config.city (
@@ -89,16 +132,26 @@ CREATE TABLE config.city (
 );
 CREATE INDEX idx_city_bounds ON config.city USING GIST (bounds);
 
+-- REVISED (Pre-Implementation Audit §8, ADR-0026): flagged_review_min_score added — Trust
+-- previously had only a single min_verified_score threshold, leaving the VERIFIED/
+-- FLAGGED_FOR_REVIEW/REJECTED boundary partly unmodeled, unlike Data Quality's two-threshold
+-- band (config.data_quality_threshold_config below). A score >= min_verified_score is VERIFIED;
+-- a score >= flagged_review_min_score (but below min_verified_score) is FLAGGED_FOR_REVIEW;
+-- below flagged_review_min_score is REJECTED. HIGH-RISK aggregate: dual control (ADR-0026).
 CREATE TABLE config.trust_threshold_config (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    city_id              UUID NOT NULL REFERENCES config.city(id),
-    min_verified_score   INT NOT NULL CHECK (min_verified_score BETWEEN 0 AND 100),
-    signal_weights       JSONB NOT NULL,
-    status               TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
-    effective_from       TIMESTAMPTZ NOT NULL,
-    rolled_back_from      UUID REFERENCES config.trust_threshold_config(id),
-    created_by_admin_id   UUID REFERENCES admin.admin_user(id),
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    city_id                  UUID NOT NULL REFERENCES config.city(id),
+    min_verified_score       INT NOT NULL CHECK (min_verified_score BETWEEN 0 AND 100),
+    flagged_review_min_score INT NOT NULL CHECK (flagged_review_min_score BETWEEN 0 AND 100),
+    signal_weights           JSONB NOT NULL,
+    status                   TEXT NOT NULL DEFAULT 'ACTIVE'
+                               CHECK (status IN ('DRAFT','PENDING_APPROVAL','ACTIVE','SUPERSEDED')),
+    effective_from           TIMESTAMPTZ NOT NULL,
+    rolled_back_from          UUID REFERENCES config.trust_threshold_config(id),
+    created_by_admin_id       UUID REFERENCES admin.admin_user(id),
+    approved_by_admin_id      UUID REFERENCES admin.admin_user(id),   -- must differ from created_by_admin_id (ADR-0026)
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_flagged_below_verified CHECK (flagged_review_min_score <= min_verified_score)
 );
 CREATE INDEX idx_trust_config_city_effective ON config.trust_threshold_config (city_id, effective_from DESC);
 
@@ -120,48 +173,66 @@ CREATE INDEX idx_reward_config_city_effective ON config.reward_rule_config (city
 
 -- NEW (Configuration inventory: "GPS Thresholds"). Shared input to both Trust's and Data
 -- Quality's GPS-related evaluators (ADR-0019) — one config, two independent consumers.
+-- REVISED (Pre-Implementation Audit §8): max_batch_size_per_request added — the GPS ingestion
+-- batch-size cap (API Specification §3) was previously a hardcoded prose constant, not
+-- configuration; it belongs here since it's GPS-ingestion-specific. HIGH-RISK aggregate: dual
+-- control (ADR-0026), since loosening these thresholds directly weakens Trust/Data-Quality
+-- GPS-plausibility checks.
 CREATE TABLE config.gps_threshold_config (
-    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    city_id                   UUID NOT NULL REFERENCES config.city(id),
-    min_accuracy_meters       NUMERIC(6,2) NOT NULL,
-    max_plausible_speed_mps   NUMERIC(6,2) NOT NULL,
-    max_ping_gap_seconds      INT NOT NULL,
-    status                    TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
-    effective_from            TIMESTAMPTZ NOT NULL,
-    rolled_back_from           UUID REFERENCES config.gps_threshold_config(id),
-    created_by_admin_id        UUID REFERENCES admin.admin_user(id),
-    created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    city_id                     UUID NOT NULL REFERENCES config.city(id),
+    min_accuracy_meters         NUMERIC(6,2) NOT NULL,
+    max_plausible_speed_mps     NUMERIC(6,2) NOT NULL,
+    max_ping_gap_seconds        INT NOT NULL,
+    max_batch_size_per_request  INT NOT NULL DEFAULT 200,
+    status                      TEXT NOT NULL DEFAULT 'ACTIVE'
+                                  CHECK (status IN ('DRAFT','PENDING_APPROVAL','ACTIVE','SUPERSEDED')),
+    effective_from              TIMESTAMPTZ NOT NULL,
+    rolled_back_from             UUID REFERENCES config.gps_threshold_config(id),
+    created_by_admin_id          UUID REFERENCES admin.admin_user(id),
+    approved_by_admin_id         UUID REFERENCES admin.admin_user(id),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_gps_threshold_city_effective ON config.gps_threshold_config (city_id, effective_from DESC);
 
 -- NEW (Configuration inventory: "Fraud Thresholds"). Input to Trust's FraudPatternDetector
 -- (aggregate rider-behavior signals, distinct from per-trip min_verified_score above).
+-- HIGH-RISK aggregate: dual control (ADR-0026).
 CREATE TABLE config.fraud_threshold_config (
     id                             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     city_id                        UUID NOT NULL REFERENCES config.city(id),
     max_verified_trips_per_day     INT NOT NULL,
     min_trip_interval_seconds      INT NOT NULL,
     duplicate_trip_window_minutes  INT NOT NULL,
-    status                         TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
+    status                         TEXT NOT NULL DEFAULT 'ACTIVE'
+                                     CHECK (status IN ('DRAFT','PENDING_APPROVAL','ACTIVE','SUPERSEDED')),
     effective_from                 TIMESTAMPTZ NOT NULL,
     rolled_back_from                UUID REFERENCES config.fraud_threshold_config(id),
     created_by_admin_id             UUID REFERENCES admin.admin_user(id),
+    approved_by_admin_id            UUID REFERENCES admin.admin_user(id),
     created_at                     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_fraud_threshold_city_effective ON config.fraud_threshold_config (city_id, effective_from DESC);
 
 -- NEW (Configuration inventory: "Advertisement Radius", "Campaign Priority" defaults).
+-- REVISED (Pre-Implementation Audit §8): min_serve_interval_seconds and min_displacement_meters
+-- added — the ad-serve call-cadence contract (ADR-0014) was previously a hardcoded prose
+-- recommendation ("~60-90s or displacement threshold"), not configuration. Not high-risk
+-- (misconfiguring ad cadence doesn't weaken fraud/quality protection) — ordinary DRAFT/ACTIVE/
+-- SUPERSEDED flow, no dual control needed.
 CREATE TABLE config.advertising_target_config (
-    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    city_id                 UUID NOT NULL REFERENCES config.city(id),
-    default_radius_meters   INT NOT NULL,
-    max_active_per_bucket   INT NOT NULL,
-    priority_tie_break_rule TEXT NOT NULL DEFAULT 'CREATED_AT_ASC',
-    status                  TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
-    effective_from          TIMESTAMPTZ NOT NULL,
-    rolled_back_from         UUID REFERENCES config.advertising_target_config(id),
-    created_by_admin_id      UUID REFERENCES admin.admin_user(id),
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    city_id                   UUID NOT NULL REFERENCES config.city(id),
+    default_radius_meters     INT NOT NULL,
+    max_active_per_bucket     INT NOT NULL,
+    priority_tie_break_rule   TEXT NOT NULL DEFAULT 'CREATED_AT_ASC',
+    min_serve_interval_seconds INT NOT NULL DEFAULT 60,
+    min_displacement_meters   INT NOT NULL DEFAULT 200,
+    status                    TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
+    effective_from            TIMESTAMPTZ NOT NULL,
+    rolled_back_from           UUID REFERENCES config.advertising_target_config(id),
+    created_by_admin_id        UUID REFERENCES admin.admin_user(id),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_ad_target_config_city_effective ON config.advertising_target_config (city_id, effective_from DESC);
 
@@ -182,14 +253,18 @@ CREATE INDEX idx_rate_limit_scope_effective ON config.rate_limit_config (scope, 
 
 -- NEW: Data Quality Platform's own tunable thresholds/weights (component weighting,
 -- READY_FOR_AI / LOW_QUALITY score cutoffs) — see dataquality schema §6.
+-- HIGH-RISK aggregate: dual control (ADR-0026) — loosening these thresholds directly
+-- weakens what can enter the ML-ready dataset.
 CREATE TABLE config.data_quality_threshold_config (
     id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     city_id                  UUID NOT NULL REFERENCES config.city(id),
     component_weights        JSONB NOT NULL,   -- { "gps":0.3,"route":0.2,"fare":0.2,"userInput":0.15,"deviceSignals":0.15 }
     ready_for_ai_min_score   NUMERIC(5,2) NOT NULL,
     low_quality_max_score    NUMERIC(5,2) NOT NULL,
-    status                   TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')),
+    status                   TEXT NOT NULL DEFAULT 'ACTIVE'
+                               CHECK (status IN ('DRAFT','PENDING_APPROVAL','ACTIVE','SUPERSEDED')),
     effective_from           TIMESTAMPTZ NOT NULL,
+    approved_by_admin_id     UUID REFERENCES admin.admin_user(id),
     rolled_back_from          UUID REFERENCES config.data_quality_threshold_config(id),
     created_by_admin_id       UUID REFERENCES admin.admin_user(id),
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -350,10 +425,14 @@ CREATE INDEX idx_trust_signal_assessment ON trust.trust_signal_result (assessmen
 -- points_balance is a denormalized read cache, never an independent source of truth (ADR-0016).
 -- Every write to it happens inside the same transaction that inserts the corresponding
 -- reward_ledger_entry, computed as SUM(ledger entries) for that wallet.
+-- REVISED (ADR-0025): the non-negative CHECK is removed here — a CLAWBACK entry (see below) can
+-- legitimately drive the derived balance negative if the rider already redeemed the points being
+-- clawed back. RedemptionService (application layer) blocks new REDEEMs while balance <= 0; the
+-- ledger itself must be able to represent the true, possibly-negative state.
 CREATE TABLE reward.reward_wallet (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     rider_id        UUID NOT NULL UNIQUE REFERENCES identity.rider(id),
-    points_balance  INT NOT NULL DEFAULT 0 CHECK (points_balance >= 0)
+    points_balance  INT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE reward.merchant (
@@ -377,21 +456,28 @@ CREATE TABLE reward.reward_offer (
 
 -- REVISED (ADR-0022): reward_rule_config_id added — every EARN entry references the exact
 -- reward policy version that produced its point amount, closing a Phase-1 reproducibility gap.
+-- REVISED (ADR-0025, Pre-Implementation Audit §1): CLAWBACK type added — reverses an EARN when
+-- a Data Quality review case (MERGED/REJECTED) discovers, after the fact, that a rewarded trip
+-- was a duplicate/fraud Trust's automated check missed. References the original source_trip_id
+-- and the review case that triggered it.
 CREATE TABLE reward.reward_ledger_entry (
     id                     BIGSERIAL PRIMARY KEY,
     wallet_id              UUID NOT NULL REFERENCES reward.reward_wallet(id),
-    type                   TEXT NOT NULL CHECK (type IN ('EARN','REDEEM')),
+    type                   TEXT NOT NULL CHECK (type IN ('EARN','REDEEM','CLAWBACK')),
     points                 INT NOT NULL,
     source_trip_id         UUID REFERENCES trip.trip(id),
     reward_offer_id        UUID REFERENCES reward.reward_offer(id),
     reward_rule_config_id  UUID REFERENCES config.reward_rule_config(id),
+    clawback_review_case_id UUID REFERENCES dataquality.data_review_case(id),
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chk_earn_has_trip CHECK (type <> 'EARN' OR source_trip_id IS NOT NULL),
     CONSTRAINT chk_redeem_has_offer CHECK (type <> 'REDEEM' OR reward_offer_id IS NOT NULL),
-    CONSTRAINT chk_earn_has_rule_config CHECK (type <> 'EARN' OR reward_rule_config_id IS NOT NULL)
+    CONSTRAINT chk_earn_has_rule_config CHECK (type <> 'EARN' OR reward_rule_config_id IS NOT NULL),
+    CONSTRAINT chk_clawback_has_case CHECK (type <> 'CLAWBACK' OR (source_trip_id IS NOT NULL AND clawback_review_case_id IS NOT NULL))
 );
 CREATE INDEX idx_ledger_wallet ON reward.reward_ledger_entry (wallet_id, created_at);
 CREATE UNIQUE INDEX idx_ledger_one_earn_per_trip ON reward.reward_ledger_entry (source_trip_id) WHERE type = 'EARN';
+CREATE UNIQUE INDEX idx_ledger_one_clawback_per_trip ON reward.reward_ledger_entry (source_trip_id) WHERE type = 'CLAWBACK';
 ```
 
 ## 8. `dataquality` Schema (Data Quality Platform — NEW, ADR-0019, ADR-0020)
@@ -426,9 +512,13 @@ CREATE INDEX idx_dq_component_assessment ON dataquality.data_quality_component_s
 
 -- Relocated from trust schema (ADR-0019): Data Quality, not Trust, is the correct long-term
 -- owner of ML-readiness feature data.
+-- REVISED (Pre-Implementation Audit §6): feature_schema_version added — if this table's column
+-- set ever evolves, downstream model-training consumers of dataquality.ml_ready_trip_dataset
+-- need a signal that the feature contract changed underneath them.
 CREATE TABLE dataquality.trip_feature_snapshot (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     trip_id               UUID NOT NULL UNIQUE REFERENCES trip.trip(id),
+    feature_schema_version INT NOT NULL DEFAULT 1,
     distance_meters       INT NOT NULL,
     duration_seconds      INT NOT NULL,
     avg_speed_mps         NUMERIC(6,2),
@@ -454,8 +544,13 @@ CREATE TABLE dataquality.data_review_case (
     resolved_at           TIMESTAMPTZ
 );
 CREATE INDEX idx_review_case_state ON dataquality.data_review_case (state);
+-- FIXED (Pre-Implementation Audit §3 — a concrete bug in the prior version of this index):
+-- the predicate must cover every OPEN state, not just PENDING_REVIEW. The state machine
+-- (ADR-0020) allows PENDING_REVIEW -> ESCALATED; the old index (WHERE state = 'PENDING_REVIEW'
+-- only) stopped protecting a case the moment it escalated, allowing a second case to be opened
+-- for the same trip while the first was still open mid-escalation.
 CREATE UNIQUE INDEX idx_review_case_one_open_per_trip ON dataquality.data_review_case (trip_id)
-    WHERE state = 'PENDING_REVIEW';
+    WHERE state IN ('PENDING_REVIEW','ESCALATED');
 
 -- Append-only case history (state transitions + reviewer notes) — same audit discipline as
 -- admin.audit_log_entry, scoped to this workflow so a case's history is queryable directly.
@@ -478,6 +573,7 @@ SELECT
     t.id AS trip_id,
     dqa.overall_score, dqa.gps_score, dqa.route_score, dqa.fare_score,
     dqa.user_input_score, dqa.device_signal_score, dqa.engine_version AS quality_engine_version,
+    tfs.feature_schema_version,
     tfs.distance_meters, tfs.duration_seconds, tfs.avg_speed_mps, tfs.max_speed_mps,
     tfs.stop_count, tfs.route_deviation_ratio, tfs.time_of_day_bucket, tfs.day_of_week
 FROM trip.trip t
@@ -506,8 +602,13 @@ CREATE TABLE feature.feature_flag (
     city_id              UUID REFERENCES config.city(id),           -- NULL = all cities
     segment_key          TEXT REFERENCES feature.feature_segment(key), -- NULL = all riders
     is_kill_switch       BOOLEAN NOT NULL DEFAULT FALSE,
+    risk_tier            TEXT NOT NULL DEFAULT 'LOW' CHECK (risk_tier IN ('LOW','HIGH')),
+    pending_toggle_by_admin_id  UUID REFERENCES admin.admin_user(id),   -- proposer, HIGH-risk kill switches only (ADR-0026)
+    approved_toggle_by_admin_id UUID REFERENCES admin.admin_user(id),   -- approver, must differ from proposer
+    emergency_override_by_admin_id UUID REFERENCES admin.admin_user(id), -- SUPER_ADMIN-only bypass, audit-logged with reason
     updated_by_admin_id  UUID REFERENCES admin.admin_user(id),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_high_risk_kill_switch_only CHECK (risk_tier = 'LOW' OR is_kill_switch = TRUE)
 );
 
 CREATE TABLE feature.feature_experiment (
@@ -608,11 +709,13 @@ CREATE INDEX idx_audit_admin_user ON admin.audit_log_entry (admin_user_id, creat
 
 ## 12. Design Notes
 
-- **Append-only tables** (`gps_ping`, `reward_ledger_entry`, `audit_log_entry`, `ad_impression`, `ad_click`, `outbox` after dispatch, `provenance_log`, `data_review_case_event`, `feature_exposure_log`, and all versioned `config.*`/`farepolicy.*` tables): enforced at the application layer (repository methods expose only `insert`/`select`) and reinforced with `REVOKE UPDATE, DELETE` at the DB role level for the application's runtime user, with a separate, audited migration-only role for exceptional corrections.
+- **Append-only tables** (`gps_ping`, `reward_ledger_entry`, `audit_log_entry`, `ad_impression`, `ad_click`, `outbox` after dispatch, `outbox_dead_letter`, `event_consumption_log`, `provenance_log`, `data_review_case_event`, `feature_exposure_log`, and all versioned `config.*`/`farepolicy.*` tables): enforced at the application layer (repository methods expose only `insert`/`select`) and reinforced with `REVOKE UPDATE, DELETE` at the DB role level for the application's runtime user, with a separate, audited migration-only role for exceptional corrections.
 - **Money** stored as `NUMERIC(10,2)` (EGP), never floating point.
 - **Geospatial** columns use SRID 4326 (WGS84), consistent with GPS/OSM data; GiST indexes on geometry columns are added only where a query actually performs spatial containment/proximity search (`trip.origin`/`destination`/`route`, `advertising.geofence.area`) — **not** on `gps_ping.location`, which is accessed exclusively per-trip/time-ordered, never spatially (ADR-0015).
-- **Partitioning is a decided, not deferred, design choice for `trip.gps_ping`**: monthly range partitions on `recorded_at` from the first migration (ADR-0015).
-- **Versioned configuration** (`config.*`, `farepolicy.fare_policy_version`) follows one shared pattern (ADR-0017): append-only, `status`, `effective_from`, `rolled_back_from`, and an `admin.audit_log_entry` write on every publish — implemented as one shared repository/service pattern in code, not copy-pasted per table.
-- **Migrations** managed via a single migration tool (TypeORM/Prisma/Knex migrations, decided in Phase 2) with one migration history per schema, run in dependency order: `admin` (at minimum `admin_user`, bootstrapped first since `config`/`farepolicy`/`feature` versioned tables all carry a `created_by_admin_id`/`updated_by_admin_id` FK to it) → `config` → `identity` → `farepolicy` → `trip` → `trust`, `reward` → `advertising` → `dataquality` → `feature` → `platform`. (`farepolicy` must precede `trip` since `trip.trip.fare_policy_version_id` references it; `dataquality` must follow `trip` and `trust` since it references both.)
-- **Concurrency-sensitive writes** (reward wallet balance, ADR-0016) are computed transactionally from their source ledger inside the same transaction as the write that changes them — never read-then-write across two statements without a transactional/locking guard.
+- **Partitioning is a decided, not deferred, design choice** for `trip.gps_ping` (ADR-0015) and, as of the Pre-Implementation Audit, `platform.outbox` and `platform.provenance_log` as well (§1.1) — monthly range partitions from the first migration in every case, not retrofitted once populated.
+- **Versioned configuration** (`config.*`, `farepolicy.fare_policy_version`) follows one shared pattern (ADR-0017): append-only, `status`, `effective_from`, `rolled_back_from`, and an `admin.audit_log_entry` write on every publish — implemented as one shared repository/service pattern in code, not copy-pasted per table. **High-risk aggregates** (`trust_threshold_config`, `fraud_threshold_config`, `gps_threshold_config`, `data_quality_threshold_config`, and any `is_kill_switch = TRUE, risk_tier = 'HIGH'` feature flag) additionally require a `PENDING_APPROVAL` step with a second, different admin's approval before taking effect (ADR-0026) — enforced at the application layer, since "a different admin than the proposer" isn't expressible as a single-table SQL constraint.
+- **Event reliability** (ADR-0023, ADR-0024): every published event carries an `event_version` (payload-shape version, distinct from config versioning) and a `correlation_id` (ADR-0027, end-to-end trace/log correlation); idempotency is enforced via `platform.event_consumption_log`, keyed on the outbox row's own unique id per named consumer — **never** on `(event_type, aggregate_id)`, which would incorrectly deduplicate legitimate repeat events for the same aggregate (e.g., a post-`CORRECTED` re-assessment). Events exceeding `max_attempts` move to `platform.outbox_dead_letter` with an alert, rather than retrying forever or being silently dropped.
+- **Migrations** managed via a single migration tool (TypeORM/Prisma/Knex migrations, decided in Phase 2) with one migration history per schema, run in dependency order: `admin` (at minimum `admin_user`, bootstrapped first since `config`/`farepolicy`/`feature` versioned tables all carry a `created_by_admin_id`/`updated_by_admin_id` FK to it) → `config` → `identity` → `farepolicy` → `trip` → `trust` → `dataquality` → `reward` → `advertising` → `feature` → `platform`. (`farepolicy` must precede `trip` since `trip.trip.fare_policy_version_id` references it; `dataquality` must precede `reward` — revised from the prior ordering — since `reward.reward_ledger_entry.clawback_review_case_id` now references `dataquality.data_review_case`, ADR-0025.)
+- **Concurrency-sensitive writes** (reward wallet balance, ADR-0016) are computed transactionally from their source ledger inside the same transaction as the write that changes them — never read-then-write across two statements without a transactional/locking guard. The wallet balance may legitimately go **negative** following a `CLAWBACK` entry (ADR-0025); `RedemptionService` blocks new `REDEEM`s while the derived balance is non-positive, but the ledger itself carries no non-negative constraint.
 - **Provenance** (ADR-0022): every table listed in Platform Extensions §1.3 carries an inline JSONB provenance column for its current value, plus a `platform.provenance_log` row per write/correction — this is a code-review-enforced convention (Coding Standards, amended) for any new computed value feeding a downstream decision, not a framework-enforced constraint.
+- **Engine-version bump discipline** (Pre-Implementation Audit §3): `engine_version` on `trust.trip_trust_assessment`/`dataquality.data_quality_assessment` is only as trustworthy as the discipline that bumps it — a CI check (Coding Standards, amended) that flags a scoring-logic change without an accompanying version bump is required, not optional, since the entire reproducibility promise depends on it.

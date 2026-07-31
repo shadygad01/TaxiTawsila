@@ -24,13 +24,14 @@ This roadmap maps the 10 development phases defined in the project's master prom
 ## Phase 3 — Core Platform
 
 - Identity & Auth module: guest session issuance, OTP/Google/Apple adapters, JWT issuance/refresh.
-- **Configuration Platform** (expanded scope, ADR-0017): the full versioned-config aggregate inventory — trust thresholds, reward rules, GPS thresholds, fraud thresholds, advertising targeting defaults, rate limits, data-quality thresholds — one shared versioned/audited/rollback-capable repository pattern, admin CRUD for each.
-- **Feature Management Platform** (ADR-0018): toggles, percentage rollouts, environment/city scoping, segments, kill switches, experiments — built here, not deferred, since Phase 3 is also where the Redis-backed cache/pub-invalidation infrastructure it shares with Configuration is built.
-- Transactional Outbox infrastructure (ADR-0011) — built here since every later reactive module (Trust, Data Quality, Reward) depends on it.
-- Permissions/RBAC module and guards, including the new `DATA_QUALITY_REVIEWER` and `FEATURE_MANAGER` roles.
+- **Configuration Platform** (expanded scope, ADR-0017): the full versioned-config aggregate inventory — trust thresholds (now with `flaggedReviewMinScore`), reward rules, GPS thresholds (now with `maxBatchSizePerRequest`), fraud thresholds, advertising targeting defaults (now with ad-serve cadence), rate limits, data-quality thresholds — one shared versioned/audited/rollback-capable repository pattern, admin CRUD for each. **High-risk aggregates get the `PENDING_APPROVAL` dual-control step from day one** (ADR-0026, Pre-Implementation Audit §5) — not retrofitted after a single-admin config incident.
+- **Feature Management Platform** (ADR-0018): toggles, percentage rollouts, environment/city scoping, segments, kill switches (with `riskTier` dual control for `HIGH`, ADR-0026), experiments — built here, not deferred, since Phase 3 is also where the Redis-backed cache/pub-invalidation infrastructure it shares with Configuration is built.
+- **Transactional Outbox infrastructure (ADR-0011, revised by ADR-0023/ADR-0024 on the Pre-Implementation Audit):** event envelope with `eventVersion`/`correlationId`, per-aggregate-ordered relay claiming, `event_consumption_log`-based idempotency, and dead-letter handling with alerting — built correctly here since every later reactive module (Trust, Data Quality, Reward) depends on it, and retrofitting event reliability after those modules exist is far more expensive than designing it in now.
+- **Distributed tracing (ADR-0027):** OpenTelemetry instrumentation adopted here, not deferred, so `correlationId` propagation through the outbox is present from the first event any later phase publishes.
+- Permissions/RBAC module and guards, including the new `DATA_QUALITY_REVIEWER` and `FEATURE_MANAGER` roles, and the dual-control approval flow.
 - Logging, audit-log infrastructure, monitoring/health endpoints.
 - Storage provider adapter (S3/MinIO).
-- **Exit criteria:** a rider can obtain a guest session and register via at least one provider; an admin can log in with RBAC enforced; audit log captures a real mutation end-to-end; a versioned config value can be published, resolved, and rolled back end-to-end; a feature flag can be toggled and observed as resolved differently by two simulated riders in different rollout buckets.
+- **Exit criteria:** a rider can obtain a guest session and register via at least one provider; an admin can log in with RBAC enforced; audit log captures a real mutation end-to-end; a versioned config value can be published, resolved, and rolled back end-to-end; a high-risk config change correctly requires a second admin's approval before taking effect; a feature flag can be toggled and observed as resolved differently by two simulated riders in different rollout buckets; a published event is traceable end-to-end via its `correlationId`; a deliberately-failing consumer correctly dead-letters its event after the configured retry ceiling and fires an alert.
 
 ## Phase 4 — Maps Platform
 
@@ -52,16 +53,18 @@ This roadmap maps the 10 development phases defined in the project's master prom
 - Trust Engine: `TrustSignalEvaluator` pipeline (GPS continuity, plausibility checks, duplicate/impossible-trip detection, spoofing indicators), consuming `GpsThresholdConfig`/`FraudThresholdConfig` (Phase 3).
 - Fraud/anomaly aggregate-behavior detection.
 - Trust Review Queue (admin-facing, `TRUST_REVIEWER` role).
-- **Data Quality Platform** (ADR-0019, ADR-0020) — built in this same phase because it consumes the same `TripCompleted` event and shares infrastructure (outbox consumption pattern, geo-metrics library) with Trust, even though it is a structurally separate context answering a different question: `DataQualityScoringEngine` component evaluators (GPS/Route/Fare/User-Input/Device-Signals), `readinessStatus` determination, `trip_feature_snapshot` persistence, the Manual Review Queue state machine, and the `dataquality.ml_ready_trip_dataset` structural gate.
-- **Exit criteria:** every completed trip receives both a trust verdict *and* a data-quality assessment, computed independently; adversarial test suite (Testing Strategy §2) passes for Trust; a Data Quality adversarial/edge-case suite (missing fields, low GPS accuracy, ambiguous scores) passes for Data Quality; flagged trips reach the Trust admin review queue; suspicious/under-review trips reach the *separate* Data Quality review queue and cannot reach `READY_FOR_AI` without a resolved case.
+- **Data Quality Platform** (ADR-0019, ADR-0020) — built in this same phase because it consumes the same `TripCompleted` event and shares infrastructure (outbox consumption pattern, geo-metrics library) with Trust, even though it is a structurally separate context answering a different question: `DataQualityScoringEngine` component evaluators (GPS/Route/Fare/User-Input/Device-Signals), `readinessStatus` determination, `trip_feature_snapshot` persistence (with `featureSchemaVersion`), the Manual Review Queue state machine (with the corrected `idx_review_case_one_open_per_trip` index covering both `PENDING_REVIEW` and `ESCALATED`, Pre-Implementation Audit §3), and the `dataquality.ml_ready_trip_dataset` structural gate.
+- `engine_version` bump discipline enforced by CI from this phase onward (Coding Standards) — the reproducibility promise for both Trust and Data Quality verdicts depends on it from their first shipped version.
+- **Exit criteria:** every completed trip receives both a trust verdict *and* a data-quality assessment, computed independently; adversarial test suite (Testing Strategy §2) passes for Trust; a Data Quality adversarial/edge-case suite (missing fields, low GPS accuracy, ambiguous scores) passes for Data Quality; flagged trips reach the Trust admin review queue; suspicious/under-review trips reach the *separate* Data Quality review queue and cannot reach `READY_FOR_AI` without a resolved case; a trip cannot have two simultaneously-open review cases even across an `ESCALATED` transition.
 
 ## Phase 7 — Rewards Platform
 
 - Points/Wallet module, reward ledger.
 - Reward rule engine wired to `TripVerified` events.
+- **Reward clawback** (ADR-0025, Pre-Implementation Audit §1): `RewardWallet`/`RedemptionService` handle the `CLAWBACK` ledger entry type, consuming `DataReviewCaseResolved` (`MERGED`/`REJECTED`) from Data Quality; wallet balance can go negative and redemption is blocked while it is; rider-facing wallet history surfaces a clawback with plain-language context (a product/support deliverable alongside the engineering mechanism).
 - Reward Provider adapters (internal coupon engine first).
 - Redemption flow requiring registration.
-- **Exit criteria:** a verified trip grants points; a registered rider can redeem points for an offer; guest-to-registered promotion correctly carries over accrued points.
+- **Exit criteria:** a verified trip grants points; a registered rider can redeem points for an offer; guest-to-registered promotion correctly carries over accrued points; a trip later found to be a duplicate/fraud by Data Quality review correctly reverses its reward via a `CLAWBACK` entry, and redemption is correctly blocked while the wallet is negative.
 
 ## Phase 8 — Advertising Platform
 
@@ -93,6 +96,9 @@ This roadmap maps the 10 development phases defined in the project's master prom
 - Full priority-weighted, budget-paced advertising arbitration (Improvement Report C2 / ADR-0014) — once real merchant volume creates genuine overlapping-targeting competition.
 - Hardware attestation (Play Integrity/App Attest) gating guest-identity reward accrual (ADR-0009) — if real abuse telemetry justifies it.
 - Percentage-rollout/segment targeting beyond MVP's scope (Feature Management Platform, ADR-0018) already ships at MVP per this revision — this line item is retained from the prior roadmap only to note it is no longer deferred, having been pulled forward into Phase 3.
+- **Public API context** (Pre-Implementation Audit §1/§9): API-key/OAuth2-client-credential access for partners/researchers/government, its own rate-limiting scope and independently-versioned contract, sitting alongside Administration as a composition layer over a deliberately narrower capability set. Not built at MVP; the seam is named now (Architecture §4) specifically so this is an anticipated extension, not a rushed retrofit, when the request eventually comes.
+- **Service-tier dimension on Fare Policy** (Pre-Implementation Audit §1): if the platform ever needs concurrent fare policies per service tier within one city, `FarePolicyVersion`'s resolution key and `Trip`'s schema both need a `serviceTier` dimension added — a documented, not urgent, forward-looking change.
+- **`POLICY_MANAGER` role** narrower than `SUPER_ADMIN` for fare-policy publishing specifically (Security Model §3) — once a distinct team owns fare-policy compliance separate from platform administration.
 
 ## Roadmap Governance
 

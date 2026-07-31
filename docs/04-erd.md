@@ -143,6 +143,7 @@ erDiagram
     TRIP_FEATURE_SNAPSHOT {
         uuid id PK
         uuid trip_id FK
+        int feature_schema_version "audit fix: ML contract versioning"
         int distance_meters
         int duration_seconds
         numeric avg_speed_mps
@@ -181,8 +182,9 @@ erDiagram
     RIDER ||--o| REWARD_WALLET : "has"
     REWARD_WALLET ||--o{ REWARD_LEDGER_ENTRY : "tracks"
     REWARD_LEDGER_ENTRY }o--o| REWARD_OFFER : "redeems"
-    REWARD_LEDGER_ENTRY }o--o| TRIP : "source_trip_id (EARN)"
+    REWARD_LEDGER_ENTRY }o--o| TRIP : "source_trip_id (EARN/CLAWBACK)"
     REWARD_LEDGER_ENTRY }o--o| REWARD_RULE_CONFIG : "priced by (EARN)"
+    REWARD_LEDGER_ENTRY }o--o| DATA_REVIEW_CASE : "triggered by (CLAWBACK, ADR-0025)"
     REWARD_OFFER }o--|| MERCHANT : "offered by"
 
     MERCHANT ||--o{ CAMPAIGN : "runs"
@@ -193,17 +195,18 @@ erDiagram
     REWARD_LEDGER_ENTRY {
         bigint id PK
         uuid wallet_id FK
-        string type "EARN|REDEEM"
+        string type "EARN|REDEEM|CLAWBACK"
         int points
         uuid source_trip_id FK
         uuid reward_offer_id FK
         uuid reward_rule_config_id FK
+        uuid clawback_review_case_id FK
     }
 
     REWARD_WALLET {
         uuid id PK
         uuid rider_id FK
-        int points_balance "derived from ledger, ADR-0016"
+        int points_balance "derived from ledger, may be negative post-clawback (ADR-0016/0025)"
     }
 
     REWARD_OFFER {
@@ -272,9 +275,11 @@ erDiagram
         uuid id PK
         uuid city_id FK
         int min_verified_score
-        string status
+        int flagged_review_min_score "ADR-0026-audit fix"
+        string status "DRAFT|PENDING_APPROVAL|ACTIVE|SUPERSEDED"
         timestamp effective_from
         uuid rolled_back_from FK
+        uuid approved_by_admin_id FK "dual control, ADR-0026"
     }
 
     REWARD_RULE_CONFIG {
@@ -293,6 +298,7 @@ erDiagram
         numeric min_accuracy_meters
         numeric max_plausible_speed_mps
         int max_ping_gap_seconds
+        int max_batch_size_per_request "audit fix: was hardcoded"
         timestamp effective_from
     }
 
@@ -329,6 +335,8 @@ erDiagram
         uuid city_id FK
         string segment_key FK
         boolean is_kill_switch
+        string risk_tier "LOW|HIGH, dual control if HIGH (ADR-0026)"
+        uuid approved_toggle_by_admin_id FK
     }
 
     FEATURE_SEGMENT {
@@ -368,15 +376,39 @@ erDiagram
 
 ## 5. Cross-Cutting Infrastructure (`platform` schema)
 
+**Revised (Pre-Implementation Audit §2, ADR-0023/ADR-0024):** the outbox contract gained `event_version` and `correlation_id`; a dead-letter table and a corrected idempotency mechanism (`event_consumption_log`, keyed on the outbox row's own identity, never on `(event_type, aggregate_id)`) were added — closing the Critical event-reliability findings from the Pre-Implementation Audit.
+
 ```mermaid
 erDiagram
+    OUTBOX ||--o{ EVENT_CONSUMPTION_LOG : "processed by (per consumer)"
+    OUTBOX ||--o| OUTBOX_DEAD_LETTER : "moves to, after max_attempts"
+
     OUTBOX {
         bigint id PK
         string event_type
+        int event_version "audit fix: payload-shape versioning"
         string aggregate_type
         uuid aggregate_id
+        uuid correlation_id "audit fix: tracing (ADR-0027)"
         jsonb payload
         timestamp dispatched_at
+        int attempts
+    }
+
+    EVENT_CONSUMPTION_LOG {
+        string consumer_name PK
+        bigint outbox_event_id PK
+        timestamp processed_at
+    }
+
+    OUTBOX_DEAD_LETTER {
+        bigint id PK
+        bigint original_outbox_id
+        string event_type
+        int total_attempts
+        string last_error
+        timestamp failed_at
+        timestamp requeued_at
     }
 
     PROVENANCE_LOG {
@@ -390,4 +422,4 @@ erDiagram
     }
 ```
 
-**Note:** these two tables have no FK relationships to domain tables by design (`aggregate_id`/`entity_id` are loosely-typed references resolved by `aggregate_type`/`entity_type` string discriminators, not hard FKs) — this is deliberate: the outbox and provenance log must be writable from any schema's transaction without creating a circular or overly rigid cross-schema FK web, and both are append-only audit/delivery mechanisms, not queried relationally in normal operation.
+**Note:** these tables have no FK relationships to domain tables by design (`aggregate_id`/`entity_id` are loosely-typed references resolved by `aggregate_type`/`entity_type` string discriminators, not hard FKs) — this is deliberate: the outbox and provenance log must be writable from any schema's transaction without creating a circular or overly rigid cross-schema FK web, and both are append-only audit/delivery mechanisms, not queried relationally in normal operation. `EVENT_CONSUMPTION_LOG`'s only relationship is to `OUTBOX` itself (`outbox_event_id`), since idempotency is now keyed on that durable identity rather than any domain-table reference (ADR-0023) — this is what makes a legitimate repeat event for the same aggregate (e.g., a post-`CORRECTED` re-assessment) distinguishable from an accidental redelivery of the same event.

@@ -59,15 +59,19 @@ If a genuinely hosted/managed instance is ever used for short-term delivery spee
 
 ## 6. Monitoring & Observability
 
-- Structured JSON logs shipped to a central log store; metrics exported in Prometheus format; dashboards (Grafana or equivalent) for API latency/error rate, Trust Engine verdict distribution, reward-grant rate, campaign delivery volume.
-- Alerting thresholds: API 5xx rate, DB connection saturation, Trust Engine anomaly-verdict spike (possible attack or miscalibration), OTP request rate spike (possible abuse).
+- Structured JSON logs (tagged with `correlationId`, ADR-0027) shipped to a central log store; metrics exported in Prometheus format; dashboards (Grafana or equivalent) for API latency/error rate, Trust Engine verdict distribution, **Data Quality readiness-status distribution** (added, Pre-Implementation Audit §7), reward-grant rate, campaign delivery volume.
+- **Distributed tracing (added, ADR-0027):** OpenTelemetry instrumentation from Phase 3, exported to a self-hosted (Jaeger/Tempo) or hosted tracing backend — kept swappable behind a generic OTLP exporter, consistent with the platform's Provider Abstraction philosophy. This is the primary tool for reconstructing a single trip's async journey across Trip → Outbox → {Trust, Data Quality} → Outbox → Reward.
+- Alerting thresholds: API 5xx rate, DB connection saturation, Trust Engine anomaly-verdict spike (possible attack or miscalibration), OTP request rate spike (possible abuse), **outbox dead-letter arrivals (any row reaching `platform.outbox_dead_letter` pages an operator — ADR-0024, since a dead-lettered event is by definition something a human must look at)**, **Data Quality Manual Review Queue backlog depth/age (added, Pre-Implementation Audit §7 — previously named as a risk in Risk Analysis but never wired to an actual alert)**.
 - Health endpoints per module (Architecture §9) aggregated into `/admin/system/health`.
+- **Connection pool isolation (added, Pre-Implementation Audit §4):** Trust and Data Quality background worker pools (now two independent consumers of `TripCompleted`, ADR-0019) get their own PgBouncer connection pool quotas, separate from the request-serving path's pool — so a scoring backlog in either worker pool cannot starve interactive API traffic (trip creation, live tracking) of database connections.
 
 ## 7. Backup & Disaster Recovery
 
 - Automated daily PostgreSQL backups (logical + physical), retained on a rolling window, stored off the primary host.
-- Restore procedure tested on a recurring schedule (not just documented) — a restore drill is a release-gate item before public launch (Risk Analysis §5).
-- RPO/RTO targets defined before production launch based on business tolerance (initial proposal: RPO ≤ 24h, RTO ≤ 4h for MVP; tightened as the platform matures).
+- **Continuous WAL archiving (PITR) — revised (Pre-Implementation Audit §3):** given the reward-points ledger is a real, trust-critical liability (not literal currency, but real user-facing value), a 24-hour RPO is too loose. Continuous WAL archiving tightens RPO to minutes at a modest operational cost (WAL storage + archiving process) — this is the stated target from launch, not the daily-snapshot-only approach originally proposed.
+- Restore procedure tested on a recurring schedule (not just documented) — a restore drill is a release-gate item before public launch (Risk Analysis §5). **Whole-database granularity, explicitly:** given the FK web spans all ten schemas, restore is always a single whole-database (or whole-cluster PITR) operation — schemas are never restored independently, which would violate referential integrity across the cross-schema FK fan-in (e.g., `config.city`).
+- RPO/RTO targets: **RPO ≤ 15 minutes** (via PITR, revised from the original 24h daily-snapshot target), **RTO ≤ 4h** for MVP; tightened further as the platform matures.
+- **Replay safety after restore (added, ADR-0023):** because outbox idempotency is keyed on each event's own durable identity via `platform.event_consumption_log`, restoring from a PITR snapshot and replaying any rows that look undispatched is safe by construction — already-processed rows are recognized and skipped rather than reprocessed. This must be included in the restore-drill test plan, not merely assumed.
 
 ## 8. Secrets & Configuration Management
 
