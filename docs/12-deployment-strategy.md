@@ -42,8 +42,8 @@ flowchart LR
 ## 4. Release Strategy
 
 - **Backend/Admin Web**: rolling deploy behind a load balancer/reverse proxy (health-checked instances swapped in/out); rollback = redeploy previous image tag (immutable, tagged builds — never redeploy from a moving branch ref).
-- **Mobile**: standard app-store release channels (internal testing → closed beta → staged rollout → full release), with a remote feature-flag kill switch (`config.feature_flag`) to disable a problematic new feature without an app-store emergency release.
-- **Migrations**: additive-first (expand/contract pattern) — add new columns/tables in one release, backfill, switch reads, then drop old columns in a later release once no running version depends on them.
+- **Mobile**: standard app-store release channels (internal testing → closed beta → staged rollout → full release), with a remote **emergency kill switch** (`feature.feature_flag`, `isKillSwitch = true` — revised, ADR-0018, supersedes the Phase 1 `config.feature_flag` reference) to disable a problematic new feature without an app-store emergency release. Kill switches propagate via Redis pub/sub (ADR-0013) within seconds of an admin toggle — this is the whole point of distinguishing them from an ordinary feature flag's 10–30s cache TTL, and release runbooks should treat "flip the kill switch" as the first response action for a bad mobile release, before considering an app-store rollback.
+- **Migrations**: additive-first (expand/contract pattern) — add new columns/tables in one release, backfill, switch reads, then drop old columns in a later release once no running version depends on them. **Schema migration order** (10 schemas as of this revision) is specified in Database Schema §12: `admin` (bootstrap `admin_user` first, since every versioned-config table across `config`/`farepolicy`/`feature` carries an admin FK) → `config` → `identity` → `farepolicy` → `trip` → `trust`, `reward` → `advertising` → `dataquality` → `feature` → `platform`.
 
 ## 5. Routing/Geocoding Infrastructure Sequencing (revised on architecture review, Improvement Report B7)
 

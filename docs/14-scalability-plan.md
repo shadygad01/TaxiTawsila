@@ -9,8 +9,10 @@ The platform must scale along three independent axes: **request volume** (more r
 ## 2. Application Tier
 
 - Backend is stateless (JWT-based auth, no server-side session affinity) — horizontally scalable by adding instances behind a load balancer, no code changes required.
-- Modular monolith (ADR-0002) scales as one unit at MVP; if one module (most likely Trust Engine, given compute-heavy scoring, or Advertising, given targeting-query load) becomes a bottleneck, it is extracted into its own service using the already-enforced module boundary (ADR-0008) — scale the hot module independently rather than the whole monolith.
-- CPU-heavy work (Trust batch scoring, campaign-targeting evaluation over many active campaigns) offloaded to background workers via a queue (Redis/BullMQ) rather than blocking request-handling instances.
+- Modular monolith (ADR-0002) scales as one unit at MVP; if one module (most likely Trust Engine or Data Quality Engine, given compute-heavy scoring, or Advertising, given targeting-query load) becomes a bottleneck, it is extracted into its own service using the already-enforced module boundary (ADR-0008/ADR-0019) — scale the hot module independently rather than the whole monolith.
+- CPU-heavy work (Trust batch scoring, Data Quality scoring, campaign-targeting evaluation over many active campaigns) offloaded to background workers via a queue (Redis/BullMQ) rather than blocking request-handling instances.
+- **Data Quality as a second parallel outbox consumer (added, ADR-0019):** `TripCompleted` now fans out to two independent worker pools (Trust, Data Quality) rather than one. Each scales independently — Data Quality's per-trip scoring cost is comparable to Trust's (a handful of aggregate queries plus route-deviation comparison), so the same capacity milestones from Trust Engine's scale story (Architecture Review §4) apply: comfortable through the 100,000 MAU band as a background worker pool, revisit only if trip volume and threshold-checking complexity grow together.
+- **Feature Management resolution must be cheap on the hot path (added, ADR-0018):** flag/segment/experiment resolution goes through the same Redis-backed short-TTL cache as Configuration Platform reads (ADR-0013) — never a per-request database round-trip. Kill-switch flags are the one exception requiring pub/sub invalidation instead of TTL, precisely because their whole purpose is sub-TTL response time during an incident.
 
 ## 3. Database Tier
 

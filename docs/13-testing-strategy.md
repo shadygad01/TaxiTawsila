@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Draft v1.0 — Phase 1
+**Status:** v1.1 — extended for the Data Quality, Feature Management, Configuration, and Fare Policy platforms (see `18-platform-extensions.md`).
 
 ## 1. Test Pyramid
 
@@ -8,15 +8,18 @@
 flowchart TB
     E2E["E2E (few)<br/>Critical user journeys across mobile/admin + real backend"]
     Integration["Integration (moderate)<br/>API + DB (Testcontainers), module boundaries"]
-    Unit["Unit (many)<br/>Domain logic: Trust signals, Fare rules, entities, value objects"]
+    Unit["Unit (many)<br/>Domain logic: Trust signals, Data Quality signals, Fare Policy rules, entities, value objects"]
     Unit --> Integration --> E2E
 ```
 
-Weighting favors unit tests on domain logic — the Trust and Fare engines are pure, framework-free domain code (Folder Structure §2) specifically so they can be exhaustively unit-tested without spinning up infrastructure.
+Weighting favors unit tests on domain logic — the Trust, Data Quality, and Fare Policy engines are pure, framework-free domain code (Folder Structure §2) specifically so they can be exhaustively unit-tested without spinning up infrastructure.
 
 ## 2. Backend Testing
 
-- **Unit**: every `TrustSignalEvaluator`, `FareEstimationStrategy`, aggregate invariant, and domain service gets table-driven unit tests covering nominal + edge + adversarial inputs (e.g., zero-distance trips, GPS gaps, teleportation between pings, negative/zero fares). Target near-100% coverage on `domain/` layers.
+- **Unit**: every `TrustSignalEvaluator`, `DataQualityComponentEvaluator`, `FarePolicyEngine.computeFareRange` case, aggregate invariant, and domain service gets table-driven unit tests covering nominal + edge + adversarial inputs (e.g., zero-distance trips, GPS gaps, teleportation between pings, negative/zero fares, missing user-input fields). Target near-100% coverage on `domain/` layers.
+- **Fare Policy reproducibility regression suite (new, ADR-0021):** replay N historical trips' stored `distanceMeters`/`durationSeconds`/traffic-signal values against their stored `farePolicyVersionId` through `computeFareRange` and assert byte-identical output to the originally stored estimate. This is the concrete test of the "historical trips must always reference the Fare Policy Version used" requirement — not just a documentation claim.
+- **Data Quality adversarial suite (new, ADR-0019, mirrors the existing Trust adversarial suite in §2 below):** a fixture set of known data-quality problem patterns (missing actual-fare entry, sparse/low-accuracy GPS, contradictory component scores near a threshold boundary) run as regression tests on every change to `DataQualityComponentEvaluator`s — grows every time a real low-quality pattern is discovered post-launch, the same way the Trust adversarial suite grows from real fraud patterns.
+- **Feature Management resolution tests (new, ADR-0018):** deterministic-hash bucketing is tested for stability (the same rider/flag pair always resolves the same way across repeated calls) and for monotonicity (increasing a rollout percentage only ever adds riders to the enabled set, never removes any) — both are correctness properties the design explicitly claims and must verify, not just assume.
 - **Integration**: each module's `infrastructure` layer (repositories, adapters) tested against a real ephemeral Postgres+PostGIS via Testcontainers — no mocked DB for repository tests. API integration tests exercise controllers end-to-end against the test DB, verifying DTO validation, RBAC guards, and audit-log side effects.
 - **Contract tests**: `shared-contracts` DTOs/events versioned; a contract test suite verifies backend responses match the documented API spec/OpenAPI shape, catching drift before it reaches mobile/admin clients.
 - **Trust Engine adversarial test suite**: a dedicated fixture set of known fraud patterns (GPS teleportation, duplicate trips, implausible speed, spoofed-location markers) run as regression tests on every change to trust signals — this suite grows every time a real fraud pattern is discovered in production (post-launch feedback loop).

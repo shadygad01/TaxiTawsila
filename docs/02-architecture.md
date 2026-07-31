@@ -1,6 +1,6 @@
 # System Architecture
 
-**Status:** Draft v1.0 — Phase 1
+**Status:** v1.1 — extended with the Data Quality, Feature Management, Configuration, and Fare Policy platforms before Phase 2. See `18-platform-extensions.md` for the full design reasoning; this document reflects the resulting state.
 
 ## 1. Architectural Style
 
@@ -69,23 +69,33 @@ flowchart TB
 
         subgraph Core Platform
             AuthMod[Identity & Auth Module]
-            ConfigMod[Configuration Module]
+            ConfigMod["Configuration Module<br/>(GPS/Fraud/RateLimit/AdTarget/<br/>DataQuality thresholds - NEW)"]
+            FeatureMod["Feature Management Module (NEW)<br/>toggles, rollouts, kill switches,<br/>segments, experiments"]
             PermMod[Permissions/RBAC Module]
             LogMod[Logging & Audit Module]
             MonMod[Monitoring/Health Module]
         end
 
         subgraph Maps Platform
-            MapAbstraction[Map/Routing/Geocoding<br/>Provider Abstraction]
+            MapAbstraction[Map/Routing/Geocoding/Traffic<br/>Provider Abstraction]
         end
 
         subgraph Trip Platform
-            TripMod["Trip Module - single public interface;<br/>GPS/Fare/History are internal<br/>services, not sibling modules<br/>(see Architecture Review item 1)"]
+            TripMod["Trip Module - single public interface;<br/>GPS/Fare-orchestration/History are internal<br/>services, not sibling modules<br/>(see Architecture Review item 1)"]
+        end
+
+        subgraph "Fare Policy Platform (NEW)"
+            FarePolicyMod["Fare Policy Engine Module<br/>(ADR-0021): owns fare business rules,<br/>consumed synchronously by Trip"]
         end
 
         subgraph Trust Platform
             TrustMod[Trust Engine Module<br/>independently deployable-ready]
             FraudMod[Fraud/Anomaly Detection]
+        end
+
+        subgraph "Data Quality Platform (NEW)"
+            DataQualityMod["Data Quality Engine Module (ADR-0019)<br/>independent of Trust; owns readiness_status"]
+            ReviewMod["Manual Review Queue (ADR-0020)"]
         end
 
         subgraph Rewards Platform
@@ -109,20 +119,30 @@ flowchart TB
     Gateway --> AuthMod
     Gateway --> TripMod
     Gateway --> AdminAPI
+    Gateway -- "resolve flags/experiments" --> FeatureMod
 
     TripMod --> MapAbstraction
+    TripMod -- "resolveActivePolicy (sync call)" --> FarePolicyMod
     TripMod -- "TripCompleted (via Outbox)" --> EventBus
     EventBus --> TrustMod
+    EventBus --> DataQualityMod
     TrustMod -- "TripVerified/TripRejected (via Outbox)" --> EventBus
     EventBus --> RewardMod
+    EventBus --> DataQualityMod
     TrustMod --> FraudMod
+    DataQualityMod --> ReviewMod
     RewardMod --> WalletMod
     RewardMod --> CouponMod
     AdMod --> AdAnalytics
     AdminAPI --> TripMod
     AdminAPI --> TrustMod
+    AdminAPI --> DataQualityMod
+    AdminAPI --> ReviewMod
     AdminAPI --> RewardMod
     AdminAPI --> AdMod
+    AdminAPI --> FarePolicyMod
+    AdminAPI --> FeatureMod
+    AdminAPI --> ConfigMod
     AdminAPI --> LogMod
     AdminAPI --> MonMod
 ```
@@ -166,6 +186,8 @@ Each Port is defined as a TypeScript interface (backend) or abstract class (Flut
 - Every trip record captures structured, ML-ready fields from day one (origin/destination, distance, duration, traffic estimate, estimated/actual fare, trust score, timestamp/day-of-week, anonymized device/user reference) — see Database Schema.
 - Anonymization: trip records reference a pseudonymous `rider_ref` (device ID or user ID), never raw PII (phone number, email) in the analytical tables. PII lives only in the Identity module's own schema.
 - The schema is designed so a future ML pipeline can read directly from a read replica / analytical schema without touching operational tables.
+- **Data Quality Platform (added, ADR-0019 — see `18-platform-extensions.md` §1):** "ML-ready" is no longer just a schema property, it's an independently governed judgment. Every completed trip gets a `DataQualityAssessment` (component scores for GPS/Route/Fare/User-Input/Device-Signals, plus overall score and `readinessStatus`), computed independently of Trust's fraud/reward verdict. The **only** sanctioned read path for any future ML training/export job is `dataquality.ml_ready_trip_dataset`, a view hard-filtered to `readinessStatus = READY_FOR_AI` — structurally preventing unreviewed low-quality data from silently entering the training set, the same way ADR-0008 structurally prevents Reward from bypassing Trust.
+- **Provenance & Reproducibility (added, ADR-0022):** every computed value that feeds a downstream decision (fare estimate, traffic estimate, trust score, data quality score, reward grant) carries an explicit `Provenance { source, producedByVersion, computedAt }` and is logged in `platform.provenance_log`. Combined with versioned configuration (ADR-0017) and the Fare Policy Engine's own versioning (ADR-0021), every historical trip is fully reproducible: which policy priced it, which trust engine version/config verified it, which data-quality engine version/config assessed it, which reward policy paid it.
 
 ## 7. Technology Stack
 
@@ -189,7 +211,8 @@ The platform explicitly avoids architectures built around pay-per-request commer
 
 ## 9. Cross-Cutting Concerns
 
-- **Configuration**: environment + database-backed dynamic config (fare rules, trust thresholds, reward rules, feature flags) — admins change behavior without deploys. **Cache invalidation (ADR-0013):** "current effective version" reads are short-TTL cached (10–30s); `TrustThresholdConfig` additionally uses Redis pub/sub invalidation given its incident-response sensitivity — required from the first horizontally-scaled deployment, not added reactively.
+- **Configuration**: environment + database-backed dynamic config — now a full Configuration Platform (ADR-0017) covering trust thresholds, reward rules, GPS thresholds, fraud thresholds, advertising targeting defaults, rate limits, and data-quality thresholds/weights, plus the separately-owned Fare Policy Engine (ADR-0021) — admins change behavior without deploys, every publish versioned/audited/rollback-capable. **Cache invalidation (ADR-0013):** "current effective version" reads are short-TTL cached (10–30s); `TrustThresholdConfig` additionally uses Redis pub/sub invalidation given its incident-response sensitivity — required from the first horizontally-scaled deployment, not added reactively.
+- **Feature Management (added, ADR-0018):** a distinct platform from Configuration — governs whether a code path is active for whom (toggles, percentage rollouts via deterministic hashing, environment/city scoping, user segments, A/B experiments) rather than what business-rule value applies. Kill-switch flags share the same fast pub/sub invalidation path as `TrustThresholdConfig`, propagating in seconds rather than the standard 10–30s TTL.
 - **Logging & Audit**: structured JSON logs; every admin action and trust/reward decision is audit-logged (immutable, append-only) — required for the Trust/Reward integrity story and future dispute resolution.
 - **Monitoring**: health endpoints per module, metrics exported (Prometheus-compatible), alerting on Trust Engine anomaly rate spikes and API error rates.
 - **Domain Event Delivery (revised, ADR-0011):** every domain event is written to a **transactional outbox** table in the same DB transaction as the state change that produced it, then drained by a relay (a polling worker at MVP, a real broker or CDC relay later) — never a bare in-process `EventEmitter` with no durability guarantee. This is a correctness requirement from Phase 3 onward, not a scale-driven upgrade deferred to later.
@@ -197,6 +220,7 @@ The platform explicitly avoids architectures built around pay-per-request commer
 
 ## 10. Multi-City & Extensibility
 
-- `City` is a first-class configuration entity: fare rules, geofences, campaign regions, and map bounds are all scoped by `city_id`. Alexandria is the first row, not a hardcoded assumption.
+- `City` is a first-class configuration entity: fare policy versions, trust/fraud/GPS/data-quality thresholds, geofences, campaign regions, and map bounds are all scoped by `city_id`. Alexandria is the first row, not a hardcoded assumption.
 - New reward providers and ad providers are added as new adapters implementing the existing `RewardProvider`/`AdProvider` ports — no core changes.
-- Future AI fare prediction plugs in as an alternate `FareEstimationStrategy` implementation behind the existing Fare Engine interface (rule-based strategy today, ML-based strategy later), selectable per city/route via configuration.
+- Future AI fare prediction plugs in as an alternate strategy behind the Fare Policy Engine's `computeFareRange` interface (rule-based strategy today, ML-based strategy later, trained against the `dataquality.ml_ready_trip_dataset` view), selectable per city/route via configuration.
+- **Bounded-context count:** the platform now has 10 bounded contexts (Identity, Trip, Fare Policy, Trust, Reward, Advertising, Data Quality, Configuration, Feature Management, Administration) — see `03-domain-model.md` for the authoritative model and `18-platform-extensions.md` for why the three new ones (Fare Policy, Data Quality, Feature Management) were added.

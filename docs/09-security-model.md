@@ -24,20 +24,24 @@ Admin roles (extensible, defined in `admin.admin_user.role`):
 |---|---|
 | `SUPER_ADMIN` | Full access, including configuration and RBAC management itself |
 | `OPS_ANALYST` | Read trips/analytics/heatmaps, no write access |
-| `TRUST_REVIEWER` | Read/write trust review queue only |
+| `TRUST_REVIEWER` | Read/write **trust** review queue only (`FLAGGED_FOR_REVIEW` reward-eligibility decisions) |
+| `DATA_QUALITY_REVIEWER` *(new, added with the Data Quality Platform — ADR-0019/0020)* | Read/write the **Data Quality** Manual Review Queue only (`data_review_case` approve/reject/merge/correct/escalate) — deliberately a separate role from `TRUST_REVIEWER` since the two queues resolve different questions and may be staffed by different people (data-quality/ops vs. fraud/trust specialists) |
+| `FEATURE_MANAGER` *(new, added with the Feature Management Platform — ADR-0018)* | Manage feature flags, segments, and experiments; toggling a kill switch is logged with the same urgency as any other audited admin action despite its fast propagation path |
 | `REWARDS_MANAGER` | Manage reward offers/providers, read ledger (no wallet mutation outside defined flows) |
 | `CAMPAIGN_MANAGER` | Manage merchants/campaigns within assigned city/cities |
 | `SUPPORT_AGENT` | Read-only rider/trip lookup for support cases, PII-redacted by default |
 
-Enforcement: a single `RolesGuard` at the Nest interface layer, backed by a declarative `@Roles(...)` decorator per admin controller method — checked centrally, not duplicated per handler. Every RBAC-gated action is audit-logged (Database Schema §8) with before/after state.
+**Fare Policy and Configuration publishing** (new `FarePolicyVersion`, `TrustThresholdConfig`, and the rest of the Configuration Platform inventory — Domain Model §9) is restricted to `SUPER_ADMIN` by default at MVP; a narrower `POLICY_MANAGER` role scoped to fare-policy publishing only is a reasonable Phase 9 addition once there's a distinct team responsible for fare-policy compliance separate from platform administration, but is not required for MVP launch.
+
+Enforcement: a single `RolesGuard` at the Nest interface layer, backed by a declarative `@Roles(...)` decorator per admin controller method — checked centrally, not duplicated per handler. Every RBAC-gated action is audit-logged (Database Schema §11) with before/after state.
 
 Passenger-side authorization: a rider can only read/mutate their own `Trip`/`RewardWallet` — enforced by always scoping repository queries by the authenticated `riderId` from the JWT, never a client-supplied ID.
 
 ## 4. Data Protection & Privacy
 
-- **PII isolation**: only the `identity` schema may store phone numbers/emails/social provider subjects. Every other schema references riders only by `rider_id` (opaque UUID) — a data export of `trip`/`trust`/`reward`/`advertising` schemas alone is inherently pseudonymous.
+- **PII isolation**: only the `identity` schema may store phone numbers/emails/social provider subjects. Every other schema — including the new `farepolicy`, `dataquality`, and `feature` schemas — references riders only by `rider_id` (opaque UUID) — a data export of `trip`/`trust`/`reward`/`advertising`/`dataquality`/`farepolicy`/`feature` schemas alone is inherently pseudonymous.
 - **Logging discipline**: structured logs must never include phone numbers, OTP codes, raw JWTs, or precise GPS traces at `INFO` level or above; a lint/log-scrubbing middleware redacts known-sensitive field names.
-- **Location data minimization**: `gps_ping` retention policy is time-bounded for raw pings post-trip-completion (aggregate/derived trip stats retained long-term for the data platform; raw high-frequency pings pruned after a configurable window — default proposal: 12 months — per Risk Analysis/legal review).
+- **Location data minimization**: `gps_ping` retention policy is time-bounded for raw pings post-trip-completion (aggregate/derived trip stats retained long-term for the data platform via `dataquality.trip_feature_snapshot`, which is exactly why that table was introduced — it survives raw-ping pruning; raw high-frequency pings pruned after a configurable window — default proposal: 12 months — per Risk Analysis/legal review). `platform.provenance_log` follows the same retention discipline as the values it describes — it is not exempted just because it's an audit table.
 - **Right to deletion**: a registered rider can request account deletion; `identity` PII rows are hard-deleted, while pseudonymous historical trip/trust/reward rows are retained (already free of PII) unless local regulation requires full trip deletion — flagged for legal review in Risk Analysis.
 - **Guest-identity reward-farming (accepted MVP risk, added on architecture review — see `16-architecture-review.md` §12–14 and ADR-0009):** because guest identity lives entirely in device-local secure storage, an app reinstall mints a fresh `deviceAnonId` and therefore a fresh reward-eligibility slate on the same physical device. MVP explicitly accepts this risk rather than requiring hardware attestation (Play Integrity/App Attest) up front, mitigated instead by capping early reward value and monitoring abuse rate; attestation-gated guest reward accrual is a named Phase 6+ hardening item to be built only if real abuse telemetry justifies the added complexity.
 - **Guest-history merge policy (ADR-0009):** promotion of a `GUEST` rider to `REGISTERED` only carries over that device's history when the device's own local rider is still `GUEST` at that moment; if the identity being verified already belongs to a different existing `REGISTERED` rider, no merge occurs. This prevents a device farm from injecting fabricated guest history into an unrelated verified account.

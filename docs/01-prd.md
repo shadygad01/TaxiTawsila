@@ -99,6 +99,15 @@ flowchart TD
 ### 7.7 Admin Dashboard
 - Full operational control plane: users, trips, rewards, merchants, ads/campaigns, heatmaps, reports, analytics, configuration, audit logs, monitoring, system health.
 
+### 7.8 Supporting Platforms (Non-Negotiable, added before Phase 2 — see `18-platform-extensions.md`)
+
+These are not user-facing features; they are the mandatory infrastructure that makes §1–2's core thesis ("the accumulated transportation data is the most valuable long-term asset") actually true rather than aspirational:
+
+- **Data Quality Platform** — every trip gets an independently-computed Data Quality Score (component scores for GPS, Route, Fare, User Input, Device Signals, plus an overall score), explicit provenance on every important computed value, versioned/reproducible calculations, a `readinessStatus` (`READY_FOR_AI`/`LOW_QUALITY`/`MISSING_DATA`/`SUSPICIOUS`/`UNDER_REVIEW`), and a Manual Review Queue gating anything ambiguous before it can ever enter a future ML dataset. This is structurally independent of the Trust Engine (§7.4/ADR-0019): a trip can be reward-verified and simultaneously not yet trusted as training data — both outcomes are legitimate and expected.
+- **Feature Management Platform** — feature toggles, percentage rollouts, environment/city scoping, emergency kill switches, user segments, and A/B experiments, all admin-configurable without a deploy (ADR-0018).
+- **Configuration Platform** — every business-rule value referenced anywhere in this document (minimum trust score, reward points/multipliers/daily limits, fare rules, GPS/fraud thresholds, advertisement radius, campaign priority, rate limits, time-based multipliers) is versioned, auditable, rollback-capable, and effective-date-aware — never hardcoded (ADR-0017).
+- **Fare Policy Engine** — fare business rules (government fare policy, base fare, distance/waiting/time-of-day rules, special adjustments) are owned independently of the Fare Estimation orchestration described in §7.1, so every historical trip remains reproducible against the exact fare policy version that priced it (ADR-0021).
+
 ## 8. Registration Policy
 
 - **Guest mode is fully functional** for estimate → track → complete → earn (points accrue against a durable anonymous/device identity).
@@ -108,7 +117,7 @@ flowchart TD
 
 ## 9. Success Metrics (initial set — refined in Scalability/Analytics phases)
 
-- **Data quality**: % of trips reaching `trust_score >= threshold` ("verified rate").
+- **Data quality**: % of trips reaching `trust_score >= threshold` ("verified rate") **and** % of trips reaching `readinessStatus = READY_FOR_AI` ("dataset-ready rate") — tracked separately, since they answer different questions (ADR-0019).
 - **Estimation accuracy**: mean absolute percentage error between estimated-range midpoint and actual fare, trending down over time.
 - **Activation**: % of guest sessions completing a full trip (estimate → actual fare entry).
 - **Retention**: repeat-trip rate per anonymous/device identity and per registered user.

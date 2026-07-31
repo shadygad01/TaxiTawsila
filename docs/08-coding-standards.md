@@ -58,13 +58,15 @@
 
 Every PR must confirm:
 
-- [ ] Domain logic has unit tests covering the change (and edge cases, especially for Trust Engine signals and Fare Engine rules).
+- [ ] Domain logic has unit tests covering the change (and edge cases, especially for Trust Engine signals, Data Quality component evaluators, and Fare Policy rules).
 - [ ] No architecture-boundary violations (domain importing infra/framework).
 - [ ] No secrets, credentials, or PII in code, logs, or fixtures.
 - [ ] API changes reflected in OpenAPI/shared-contracts and this spec doc if the contract shape changed.
 - [ ] Database migrations are backward-compatible with the currently deployed app version (no destructive column drops in the same release that still reads them).
 - [ ] Audit logging added for any new admin-mutating action.
 - [ ] No new pay-per-request third-party dependency introduced without an ADR (Cost Strategy).
+- [ ] **New computed value that feeds a downstream decision (fare, trust, quality, reward) has a provenance column and is logged in `platform.provenance_log`** (ADR-0022) — no exceptions without an explicit reviewer sign-off explaining why the value doesn't need reproducibility.
+- [ ] **New business-rule config value is added as a versioned aggregate following the ADR-0017 shape** (append-only, `status`, `effective_from`, `rolled_back_from`, audit-logged), never as a mutable single-row setting.
 
 ## 9. Testing Conventions
 
