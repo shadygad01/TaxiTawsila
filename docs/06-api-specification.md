@@ -28,7 +28,7 @@
 |---|---|---|
 | POST | `/auth/guest` | Create/resume a guest session from `deviceAnonId`. Returns JWT scoped to `GUEST` rider. |
 | POST | `/auth/otp/request` | Request an OTP to a phone number. |
-| POST | `/auth/otp/verify` | Verify OTP; promotes/creates `REGISTERED` rider, merges guest history if `deviceAnonId` provided. Returns JWT. |
+| POST | `/auth/otp/verify` | Verify OTP; promotes/creates `REGISTERED` rider, merges guest history if `deviceAnonId` provided **and that device's rider is still `GUEST`** (added on architecture review, ADR-0009) — if the phone number already belongs to a different existing `REGISTERED` rider, no merge occurs and the response simply authenticates into that account. Returns JWT. |
 | POST | `/auth/google` | Exchange Google ID token; promote/create rider. |
 | POST | `/auth/apple` | Exchange Apple ID token; promote/create rider. |
 | POST | `/auth/refresh` | Exchange refresh token for new access token. |
@@ -40,7 +40,7 @@
 |---|---|---|
 | POST | `/trips/estimate` | Body: `{ origin, destination, cityId }`. Returns `{ estimatedFareMin, estimatedFareMax, distanceMeters, estimatedDurationSeconds, route }`. No trip is persisted yet. |
 | POST | `/trips` | Start a trip from a prior estimate. Body: `{ origin, destination, cityId, estimateRef }`. Returns `Trip` in `ACTIVE` status. |
-| POST | `/trips/{tripId}/gps` | Append GPS ping(s) during an active trip. Body: `{ pings: [{ lat, lng, accuracy, speed, recordedAt }] }`. Accepts batched pings for offline-buffered flush. |
+| POST | `/trips/{tripId}/gps` | Append GPS ping(s) during an active trip. Body: `{ pings: [{ clientPingId, lat, lng, accuracy, speed, recordedAt }] }`. Accepts batched pings for offline-buffered flush. **Contract, added on architecture review (Improvement Report B6, ADR-0015):** each ping carries a client-generated `clientPingId`; ingestion is idempotent on `(tripId, clientPingId)` so a retried flush never double-inserts. Batches are capped at a fixed max size per request (oversized offline buffers are chunked client-side across multiple requests, not sent as one unbounded array). The server additionally stamps `receivedAt` per ping — not client-supplied. |
 | GET | `/trips/{tripId}/live` | Current live-tracking snapshot: position, traveled route, remaining distance/time, updated fare estimate. |
 | POST | `/trips/{tripId}/complete` | Body: `{ actualFare }`. Transitions trip to `COMPLETED`, triggers async Trust Engine evaluation. Idempotent via `Idempotency-Key`. |
 | POST | `/trips/{tripId}/cancel` | Cancel an active trip. |
@@ -60,7 +60,7 @@
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/ads/serve` | Query params: `tripId` or `{lat,lng}`. Returns priority-ranked matched campaign creative(s) for current context. Internally records an `AdImpression`. |
+| GET | `/ads/serve` | Query params: `tripId` or `{lat,lng}`. Returns the best-matching active campaign creative for current context (V1: single best match, ties by creation order — full priority arbitration deferred, see ADR-0014). Internally records an `AdImpression`. **Call-cadence contract (added on architecture review, ADR-0014): clients must call this only at trip-lifecycle moments — trip start, periodic ~60–90s/displacement-threshold intervals, and trip completion — never on every raw GPS ping.** |
 | POST | `/ads/{impressionId}/click` | Records an `AdClick` against a prior impression. |
 
 ## 6. Configuration (public-read subset) — `/config`

@@ -16,6 +16,7 @@ One Postgres **schema per bounded context**, matching the modular-monolith modul
 | `advertising` | Advertising Platform |
 | `config` | Configuration |
 | `admin` | Administration / Audit |
+| `platform` | Cross-cutting infrastructure (transactional outbox — ADR-0011) |
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS postgis;
@@ -29,7 +30,28 @@ CREATE SCHEMA IF NOT EXISTS reward;
 CREATE SCHEMA IF NOT EXISTS advertising;
 CREATE SCHEMA IF NOT EXISTS config;
 CREATE SCHEMA IF NOT EXISTS admin;
+CREATE SCHEMA IF NOT EXISTS platform;
 ```
+
+### 1.1 Transactional Outbox (`platform` schema) — added on architecture review, ADR-0011
+
+Every module that publishes a domain event writes it here, in the **same transaction** as the state change that produced it. A relay worker polls `dispatched_at IS NULL ORDER BY created_at`, delivers to consumers, and marks rows dispatched — in-process at MVP, swappable for a real broker/CDC relay later without changing this table's contract.
+
+```sql
+CREATE TABLE platform.outbox (
+    id             BIGSERIAL PRIMARY KEY,
+    event_type     TEXT NOT NULL,          -- e.g. 'TripCompleted', 'TripVerified'
+    aggregate_type TEXT NOT NULL,          -- e.g. 'Trip'
+    aggregate_id   UUID NOT NULL,
+    payload        JSONB NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    dispatched_at  TIMESTAMPTZ,
+    attempts       INT NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_outbox_undispatched ON platform.outbox (created_at) WHERE dispatched_at IS NULL;
+```
+
+Consumers must be idempotent per `(event_type, aggregate_id)` since delivery is at-least-once (a relay crash between dispatch and marking `dispatched_at` can redeliver).
 
 ## 2. `config` Schema
 
@@ -144,19 +166,33 @@ CREATE INDEX idx_trip_route ON trip.trip USING GIST (route);
 CREATE INDEX idx_trip_completed_at ON trip.trip (completed_at) WHERE status = 'COMPLETED';
 
 -- Append-only; application layer must never UPDATE/DELETE rows here.
+-- REVISED on architecture review (ADR-0015): no per-row spatial index (no query performs
+-- spatial containment over individual pings — all access is per-trip, time-ordered), monthly
+-- range partitioning on recorded_at from the first migration (not retrofitted later), a
+-- server-stamped received_at for client-timestamp cross-checking, and a client-generated
+-- ping ID for idempotent batched-flush ingestion.
 CREATE TABLE trip.gps_ping (
-    id           BIGSERIAL PRIMARY KEY,
-    trip_id      UUID NOT NULL REFERENCES trip.trip(id) ON DELETE CASCADE,
-    location     GEOMETRY(POINT, 4326) NOT NULL,
-    accuracy_m   NUMERIC(6,2),
-    speed_mps    NUMERIC(6,2),
-    recorded_at  TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX idx_gps_ping_trip ON trip.gps_ping (trip_id, recorded_at);
-CREATE INDEX idx_gps_ping_location ON trip.gps_ping USING GIST (location);
+    id              BIGSERIAL,
+    trip_id         UUID NOT NULL REFERENCES trip.trip(id) ON DELETE CASCADE,
+    client_ping_id  UUID NOT NULL,
+    location        GEOMETRY(POINT, 4326) NOT NULL,
+    accuracy_m      NUMERIC(6,2),
+    speed_mps       NUMERIC(6,2),
+    recorded_at     TIMESTAMPTZ NOT NULL,       -- client-claimed capture time
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(), -- server-observed arrival time
+    PRIMARY KEY (id, recorded_at)
+) PARTITION BY RANGE (recorded_at);
 
--- Partitioning: gps_ping and trip are the highest-volume tables.
--- Recommend range partitioning by month on recorded_at/created_at once volume warrants (see Scalability Plan).
+-- Composite time-ordered index is the primary access path (WHERE trip_id = ? ORDER BY recorded_at).
+CREATE INDEX idx_gps_ping_trip_time ON trip.gps_ping (trip_id, recorded_at);
+CREATE UNIQUE INDEX idx_gps_ping_idempotency ON trip.gps_ping (trip_id, client_ping_id);
+
+-- Monthly partitions created ahead of need by a scheduled maintenance job, e.g.:
+-- CREATE TABLE trip.gps_ping_2026_08 PARTITION OF trip.gps_ping
+--     FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+-- Large divergence between (recorded_at) and (received_at) is a Trust Engine input
+-- (client clocks are not a trusted source for fraud-relevant timing) — see Threat Model.
 ```
 
 ## 5. `trust` Schema
@@ -182,11 +218,33 @@ CREATE TABLE trust.trust_signal_result (
     detail         JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 CREATE INDEX idx_trust_signal_assessment ON trust.trust_signal_result (assessment_id);
+
+-- Added on architecture review (Improvement Report B5 / Review §23): persist the per-trip
+-- feature vector the Trust Engine already computes, so future ML training reads a stable
+-- derived table instead of recomputing from raw gps_ping (which is retention-pruned over time).
+CREATE TABLE trust.trip_feature_snapshot (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    assessment_id         UUID NOT NULL UNIQUE REFERENCES trust.trip_trust_assessment(id) ON DELETE CASCADE,
+    distance_meters       INT NOT NULL,
+    duration_seconds      INT NOT NULL,
+    avg_speed_mps         NUMERIC(6,2),
+    max_speed_mps         NUMERIC(6,2),
+    stop_count            INT NOT NULL DEFAULT 0,
+    route_deviation_ratio NUMERIC(6,3),
+    time_of_day_bucket    TEXT,
+    day_of_week           SMALLINT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 ## 6. `reward` Schema
 
 ```sql
+-- REVISED on architecture review (ADR-0016): points_balance is a denormalized read cache,
+-- never an independent source of truth. Every write to it happens inside the same transaction
+-- that inserts the corresponding reward_ledger_entry, computed as SUM(ledger entries) for that
+-- wallet — never incremented/decremented independently — which is what actually prevents the
+-- double-redemption race the original design left unguarded.
 CREATE TABLE reward.reward_wallet (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     rider_id        UUID NOT NULL UNIQUE REFERENCES identity.rider(id),
@@ -301,8 +359,9 @@ CREATE INDEX idx_audit_admin_user ON admin.audit_log_entry (admin_user_id, creat
 
 ## 9. Design Notes
 
-- **Append-only tables** (`gps_ping`, `reward_ledger_entry`, `audit_log_entry`, `ad_impression`, `ad_click`, and all `config.*` version tables): enforced at the application layer (repository methods expose only `insert`/`select`) and reinforced with `REVOKE UPDATE, DELETE` at the DB role level for the application's runtime user, with a separate, audited migration-only role for exceptional corrections.
+- **Append-only tables** (`gps_ping`, `reward_ledger_entry`, `audit_log_entry`, `ad_impression`, `ad_click`, `outbox` after dispatch, and all `config.*` version tables): enforced at the application layer (repository methods expose only `insert`/`select`) and reinforced with `REVOKE UPDATE, DELETE` at the DB role level for the application's runtime user, with a separate, audited migration-only role for exceptional corrections.
 - **Money** stored as `NUMERIC(10,2)` (EGP), never floating point.
-- **Geospatial** columns use SRID 4326 (WGS84), consistent with GPS/OSM data; GiST indexes on every geometry column used in targeting/trust queries.
-- **Partitioning** deferred to Scalability Plan but schema is partition-ready (natural partition keys: `created_at`/`recorded_at`, `city_id`).
-- **Migrations** managed via a single migration tool (TypeORM/Prisma/Knex migrations, decided in Phase 2) with one migration history per schema, run in dependency order (`config`, `identity` → `trip` → `trust`, `reward` → `advertising` → `admin`).
+- **Geospatial** columns use SRID 4326 (WGS84), consistent with GPS/OSM data; GiST indexes on geometry columns are added only where a query actually performs spatial containment/proximity search (`trip.origin`/`destination`/`route`, `advertising.geofence.area`) — **not** on `gps_ping.location`, which is accessed exclusively per-trip/time-ordered, never spatially (see ADR-0015; this reverses the original schema's blanket "GiST index on every geometry column" stance).
+- **Partitioning is a decided, not deferred, design choice for `trip.gps_ping`**: monthly range partitions on `recorded_at` from the first migration (ADR-0015) — the highest-volume table in the system does not get to "consider partitioning later," because retrofitting it after the table is populated is materially more disruptive than designing it in from the start. Other tables remain partition-ready (`city_id`, `created_at`) but don't need day-one partitioning at MVP volume.
+- **Migrations** managed via a single migration tool (TypeORM/Prisma/Knex migrations, decided in Phase 2) with one migration history per schema, run in dependency order (`config`, `identity` → `trip` → `trust`, `reward` → `advertising` → `admin` → `platform`).
+- **Concurrency-sensitive writes** (reward wallet balance, ADR-0016; any future similarly balance-like aggregate) are computed transactionally from their source ledger inside the same transaction as the write that changes them — never read-then-write across two statements without a transactional/locking guard.

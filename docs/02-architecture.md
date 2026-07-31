@@ -80,10 +80,7 @@ flowchart TB
         end
 
         subgraph Trip Platform
-            TripMod[Trip Engine Module]
-            GPSMod[GPS Engine Module]
-            FareMod[Fare Engine Module]
-            HistMod[History & Statistics Module]
+            TripMod["Trip Module - single public interface;<br/>GPS/Fare/History are internal<br/>services, not sibling modules<br/>(see Architecture Review item 1)"]
         end
 
         subgraph Trust Platform
@@ -106,7 +103,7 @@ flowchart TB
             AdminAPI[Admin API Module]
         end
 
-        EventBus[[Internal Domain Event Bus]]
+        EventBus[["Transactional Outbox + Relay<br/>(ADR-0011)"]]
     end
 
     Gateway --> AuthMod
@@ -114,13 +111,10 @@ flowchart TB
     Gateway --> AdminAPI
 
     TripMod --> MapAbstraction
-    TripMod -- TripCompleted event --> EventBus
+    TripMod -- "TripCompleted (via Outbox)" --> EventBus
     EventBus --> TrustMod
-    TrustMod -- TrustScored event --> EventBus
+    TrustMod -- "TripVerified/TripRejected (via Outbox)" --> EventBus
     EventBus --> RewardMod
-    TripMod --> GPSMod
-    TripMod --> FareMod
-    TripMod --> HistMod
     TrustMod --> FraudMod
     RewardMod --> WalletMod
     RewardMod --> CouponMod
@@ -140,16 +134,19 @@ flowchart TB
 | Port (interface, owned by domain) | MVP Adapter | Future/Alt Adapter |
 |---|---|---|
 | `MapProvider` | MapLibre/Leaflet + OSM tiles | Self-hosted tile server |
-| `RoutingProvider` | Hosted OSRM instance | Self-hosted OSRM cluster |
-| `GeocodingProvider` | Hosted Nominatim | Self-hosted Nominatim |
+| `RoutingProvider` | Self-hosted OSRM (single small VM, Alexandria-only extract — see ADR-0005 sequencing revision) | Self-hosted OSRM cluster, multi-region |
+| `GeocodingProvider` | Self-hosted Nominatim (single small VM, Alexandria-only extract) | Self-hosted Nominatim cluster, multi-region |
 | `NotificationProvider` | Firebase Cloud Messaging | Self-hosted push (UnifiedPush) / APNs direct |
 | `StorageProvider` | S3-compatible object storage | Self-hosted MinIO |
-| `AuthenticationProvider` | OTP via SMS gateway, Google, Apple | Additional OIDC providers |
+| `AuthenticationProvider` | OTP via SMS gateway, Google, Apple | Additional OIDC providers, WhatsApp OTP |
 | `AnalyticsProvider` | Internal analytics module | Self-hosted (Plausible/Matomo) or external |
 | `RewardProvider` | Internal coupon engine | Third-party loyalty/merchant APIs |
 | `AdProvider`/`Ad Serving` | Internal campaign engine | N/A (always first-party — core IP) |
+| `TrafficProvider` *(added on architecture review, ADR-0012)* | Static time-of-day/day-of-week multiplier read from `FareRuleSet` | Historical-speed-derived or live-traffic adapter, post-MVP |
 
 Each Port is defined as a TypeScript interface (backend) or abstract class (Flutter) in a **shared contracts package**, with the concrete adapter injected via dependency injection / service locator at the composition root. Swapping a provider means writing a new adapter class and changing one DI binding — zero changes to domain/business logic. See ADR-0003.
+
+**Region-awareness (added on architecture review, Improvement Report A5):** `MapProvider`/`RoutingProvider`/`GeocodingProvider` method signatures accept an explicit `cityId`/region parameter from the start, even though the MVP adapter ignores it and always targets the single Alexandria instance. This avoids a call-site-wide interface change when a second city's regional instance is introduced.
 
 ## 5. Frontend Architecture
 
@@ -188,14 +185,15 @@ Each Port is defined as a TypeScript interface (backend) or abstract class (Flut
 
 ## 8. Cost Strategy
 
-The platform explicitly avoids architectures built around pay-per-request commercial APIs (e.g., Google Maps/Directions/Places billing per call). All chosen defaults (OSM/OSRM/Nominatim/PostGIS) are open-source and self-hostable. Hosted instances (e.g., a managed OSRM/Nominatim endpoint) may be used at MVP for speed of delivery, but **only behind the Provider Abstraction layer**, so migrating to self-hosted infrastructure later is an adapter swap plus infra provisioning — never a domain-code rewrite. See ADR-0005.
+The platform explicitly avoids architectures built around pay-per-request commercial APIs (e.g., Google Maps/Directions/Places billing per call). All chosen defaults (OSM/OSRM/Nominatim/PostGIS) are open-source and self-hostable. **Revised on architecture review (Improvement Report B7):** because a single-city OSM extract makes a self-hosted OSRM+Nominatim footprint cheap from day one (a single small VM, not a cluster), MVP targets **self-hosted infrastructure directly**, skipping an interim hosted-instance stage — there is no cost-optimal reason to stand up a hosted dependency only to migrate away from it shortly after. The Provider Abstraction layer (ADR-0003) still governs the interface either way, so this is a sequencing correction, not a reversal of the self-hosting goal. See ADR-0005 and Deployment Strategy §5.
 
 ## 9. Cross-Cutting Concerns
 
-- **Configuration**: environment + database-backed dynamic config (fare rules, trust thresholds, reward rules, feature flags) — admins change behavior without deploys.
+- **Configuration**: environment + database-backed dynamic config (fare rules, trust thresholds, reward rules, feature flags) — admins change behavior without deploys. **Cache invalidation (ADR-0013):** "current effective version" reads are short-TTL cached (10–30s); `TrustThresholdConfig` additionally uses Redis pub/sub invalidation given its incident-response sensitivity — required from the first horizontally-scaled deployment, not added reactively.
 - **Logging & Audit**: structured JSON logs; every admin action and trust/reward decision is audit-logged (immutable, append-only) — required for the Trust/Reward integrity story and future dispute resolution.
 - **Monitoring**: health endpoints per module, metrics exported (Prometheus-compatible), alerting on Trust Engine anomaly rate spikes and API error rates.
-- **Internal Event Bus**: in-process (Nest `EventEmitter`/CQRS module) at MVP, with message shapes designed to be lift-and-shifted onto a real broker (e.g., Redis Streams/RabbitMQ) if/when modules are extracted into services.
+- **Domain Event Delivery (revised, ADR-0011):** every domain event is written to a **transactional outbox** table in the same DB transaction as the state change that produced it, then drained by a relay (a polling worker at MVP, a real broker or CDC relay later) — never a bare in-process `EventEmitter` with no durability guarantee. This is a correctness requirement from Phase 3 onward, not a scale-driven upgrade deferred to later.
+- **Rate Limiting**: Redis-backed distributed counters (ADR-0013) for OTP, trip creation, GPS ingestion, and ad-serve endpoints — must be correct under multiple backend instances from the first implementation, since per-instance in-memory limiting silently under-counts abuse the moment a second instance is deployed.
 
 ## 10. Multi-City & Extensibility
 

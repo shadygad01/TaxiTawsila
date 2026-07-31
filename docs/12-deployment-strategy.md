@@ -45,14 +45,17 @@ flowchart LR
 - **Mobile**: standard app-store release channels (internal testing → closed beta → staged rollout → full release), with a remote feature-flag kill switch (`config.feature_flag`) to disable a problematic new feature without an app-store emergency release.
 - **Migrations**: additive-first (expand/contract pattern) — add new columns/tables in one release, backfill, switch reads, then drop old columns in a later release once no running version depends on them.
 
-## 5. Self-Hosting Migration Path (Cost Strategy Follow-Through)
+## 5. Routing/Geocoding Infrastructure Sequencing (revised on architecture review, Improvement Report B7)
 
-Hosted OSRM/Nominatim (and any other initially-hosted provider) migrate to self-hosted infrastructure when a defined trigger is hit (e.g., request volume/cost threshold, or reliability SLA miss). Because these sit behind Provider Abstraction Ports (ADR-0003), migration steps are:
+**MVP targets self-hosted OSRM + Nominatim directly — a single small VM running an Alexandria-only OSM extract — skipping an interim hosted-instance stage.** The original plan implied "hosted first, self-host later once volume justifies it," but a single-city extract makes the self-hosted footprint cheap enough from day one that standing up a hosted dependency only to migrate away from it shortly after is a needless project, not a cost optimization. This is a sequencing correction, not a reversal of the self-hosting goal in ADR-0005.
 
-1. Stand up self-hosted instance (containerized OSRM/Nominatim with regional OSM extract) in `infra/docker` or `infra/k8s`.
-2. Implement/point the existing adapter at the new endpoint (no domain code changes).
-3. Shadow-test in staging, compare output parity, cut over via configuration.
-4. Decommission hosted dependency.
+Capacity growth path (still behind Provider Abstraction Ports, ADR-0003, so no domain-code changes at any step):
+
+1. **MVP (100–10,000 MAU):** one self-hosted VM running OSRM + Nominatim against the Alexandria extract.
+2. **Growth (100,000 MAU):** move from one VM to a small self-hosted cluster (2–3 instances behind a load balancer), still one region.
+3. **Multi-city / very high scale:** per-region self-hosted instances, selected via the `cityId`/region parameter now part of the `RoutingProvider`/`GeocodingProvider` port signatures (Architecture §4, Improvement Report A5) — no interface change needed when this point is reached.
+
+If a genuinely hosted/managed instance is ever used for short-term delivery speed at some future point (e.g., entering a brand-new city before self-hosted infrastructure is provisioned there), the same Provider Abstraction makes that a temporary adapter choice, reversible without a domain-code change — but it is not the planned MVP path.
 
 ## 6. Monitoring & Observability
 

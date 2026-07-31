@@ -15,7 +15,7 @@ The platform must scale along three independent axes: **request volume** (more r
 ## 3. Database Tier
 
 - **Read replicas**: read-heavy paths (admin analytics/reports, trip history listing, ad-targeting lookups) directed to read replicas, keeping the primary free for write-heavy trip/GPS/ledger paths.
-- **Partitioning**: `trip.gps_ping` and `trip.trip` are natural candidates for range partitioning by month (`recorded_at`/`created_at`) once volume warrants — keeps indexes small and vacuum/maintenance cheap; schema already designed partition-ready (Database Schema §9).
+- **Partitioning**: `trip.gps_ping` is monthly-range-partitioned on `recorded_at` **from the first migration**, not "once volume warrants" — this was revised on architecture review (ADR-0015) because retrofitting partitioning onto a populated, growing table is materially more disruptive than designing it in from the start. `trip.trip` remains partition-ready (`city_id`, `created_at`) but doesn't need day-one partitioning at MVP volume.
 - **City-based sharding (future)**: `city_id` is present on every relevant table specifically so that, if a single Postgres instance can no longer serve all cities, data can be sharded by city without a schema redesign — a later-stage option, not an MVP requirement.
 - **Connection pooling**: PgBouncer (or equivalent) in front of Postgres from day one to avoid connection exhaustion as instance count grows.
 - **Append-only ledger tables** (`reward_ledger_entry`, `gps_ping`, `audit_log_entry`) avoid update-heavy hot rows, keeping write amplification and lock contention low as volume grows.
@@ -27,8 +27,8 @@ The platform must scale along three independent axes: **request volume** (more r
 
 ## 5. Geospatial Query Performance
 
-- GiST indexes on every geometry column used in hot paths (`trip.origin`/`destination`/`route`, `advertising.geofence.area`) — verified via `EXPLAIN ANALYZE` as part of the integration test suite for any new geospatial query.
-- Campaign-targeting evaluation (matching a live trip position against many active geofences) is the platform's highest-cardinality spatial query; if candidate-campaign count grows large per city, pre-filter using a coarse spatial index (e.g., geohash bucket) before the precise PostGIS containment check.
+- GiST indexes on every geometry column used in hot paths (`trip.origin`/`destination`/`route`, `advertising.geofence.area`) — verified via `EXPLAIN ANALYZE` as part of the integration test suite for any new geospatial query. `gps_ping.location` deliberately has **no** spatial index (ADR-0015) since nothing queries it spatially; indexing it would only add write cost.
+- **Campaign-targeting evaluation and call cadence (revised, ADR-0014):** ad-serve is evaluated at trip-lifecycle moments (start, ~60–90s/displacement-threshold intervals, completion) — never per raw GPS ping — with a coarse spatial pre-filter (geohash/grid bucket, recomputed on campaign change) narrowing candidates before precise PostGIS containment. Getting the call cadence right at design time avoids this becoming the hottest path in the system purely from tracking overhead, independent of campaign count.
 
 ## 6. Multi-City Expansion
 

@@ -42,6 +42,7 @@ flowchart LR
   - `authIdentities[]`: linked OTP phone / Google / Apple identities (only present once registered)
   - `createdAt`, `registeredAt?`
   - Invariant: a `GUEST` rider can be promoted to `REGISTERED` exactly once, preserving `RiderId` — all historical trips/points carry forward (merge-on-registration), never re-keyed.
+  - **Invariant (added on architecture review, ADR-0009):** merge-on-registration only occurs when the device's own local `Rider` is still `GUEST` at the moment of registration. If the auth identity being linked already belongs to a different, existing `REGISTERED` rider, promotion does not happen — the device authenticates into that existing `Rider` instead, and the device's prior guest history is left un-migrated. This closes a cross-account history-injection vector (see Threat Model §2).
 - **Value Objects:** `PhoneNumber`, `AuthProviderRef`
 - **Domain Events:** `RiderRegistered`, `RiderPromotedFromGuest`
 
@@ -62,10 +63,11 @@ flowchart LR
   - `gpsTrack: GpsPing[]` (append-only during ACTIVE)
   - `startedAt`, `completedAt?`
   - Invariants: `actualFare` can only be set when `status = COMPLETED`; `gpsTrack` is append-only and never mutated retroactively (integrity requirement for Trust Engine).
-- **Entities:** `GpsPing { lat, lng, accuracy, speed, timestamp }`
+- **Entities:** `GpsPing { lat, lng, accuracy, speed, recordedAt, receivedAt }` — `receivedAt` is server-stamped and cross-checked against `recordedAt` as a trust signal (added on architecture review, ADR-0015).
 - **Value Objects:** `GeoPoint`, `Money`, `RoutePolyline`, `FareRange`
-- **Domain Services:** `FareEstimationService` (strategy-pluggable, see Architecture §10), `TripLifecycleService`
-- **Domain Events:** `TripStarted`, `TripCompleted { tripId, estimatedFare, actualFare, gpsTrack, route }`, `TripCancelled`
+- **Domain Services:** `FareEstimationService` (strategy-pluggable, see Architecture §10; consumes a `TrafficProvider` port per ADR-0012), `TripLifecycleService`
+- **Domain Events:** `TripStarted`, `TripCompleted { tripId, estimatedFare, actualFare, gpsTrack, route }`, `TripCancelled` — published via the transactional outbox (ADR-0011), not a bare in-process emitter, so `TripCompleted` can never be silently lost between commit and Trust Engine consumption.
+- **Implementation note (added on architecture review, Review §1):** `GPSMod`/`FareMod`/`HistMod` referenced in the Architecture C4 diagram are internal service classes within this one Trip module/aggregate — not separate bounded contexts or sibling modules with their own public interface.
 
 ## 4. Trust Context
 
@@ -77,9 +79,9 @@ flowchart LR
   - `signals: TrustSignalResult[]` — one row per rule evaluated (GPS continuity, duration plausibility, distance plausibility, speed plausibility, origin/destination consistency, route deviation, GPS signal quality, fare plausibility, duplicate-trip check, impossible-trip check, spoofing indicators)
   - `verdict`: `VERIFIED | REJECTED | FLAGGED_FOR_REVIEW`
   - `evaluatedAt`, `ruleSetVersion` (so historical assessments are reproducible/auditable against the rule version that produced them)
-- **Value Objects:** `TrustSignalResult { signalName, score, weight, detail }`
+- **Value Objects:** `TrustSignalResult { signalName, score, weight, detail }`, **`TripFeatureSnapshot`** (added on architecture review, Improvement Report B5: the per-trip feature vector — distance, duration, avg/max speed, stop count, route-deviation ratio, time-of-day bucket, day-of-week — persisted at scoring time as first-class ML-ready data, rather than requiring future recomputation from raw, retention-pruned `gps_ping` rows)
 - **Domain Services:** `TrustScoringEngine` (composes pluggable `TrustSignalEvaluator[]`, each independently unit-testable), `FraudPatternDetector`
-- **Domain Events:** `TripVerified { tripId, trustScore }`, `TripRejected { tripId, reason }`
+- **Domain Events:** `TripVerified { tripId, trustScore }`, `TripRejected { tripId, reason }` — published via the transactional outbox (ADR-0011), consumed idempotently by Reward.
 - **Policy:** `verdict = REJECTED` or `trustScore < config.trustThreshold` ⇒ no `TripVerified` event is ever published ⇒ Reward context structurally cannot grant points for it.
 
 ## 5. Reward Context
@@ -88,11 +90,11 @@ flowchart LR
 
 - **Aggregate Root: `RewardWallet`**
   - `riderRef` (RiderId)
-  - `pointsBalance`
+  - `pointsBalance` — **derived, not independently written** (added on architecture review, ADR-0016): computed as `SUM(ledger entries)` inside the same transaction as any new ledger entry; never incremented/decremented as a separate write, which is what prevents a double-redemption race.
   - `ledger: RewardLedgerEntry[]` (append-only: `EARN` from verified trips, `REDEEM` against a `RewardProvider`)
 - **Entity: `RewardLedgerEntry { entryId, type, points, sourceTripId?, providerRef?, createdAt }`**
 - **Aggregate: `RewardOffer`** (a redeemable item: coupon/merchant promo), owned by a `RewardProvider` adapter, with `pointsCost`, `merchantId`, `validity window`.
-- **Domain Services:** `RewardRuleEngine` (points-per-verified-trip, configurable, possibly tiered by trust score/distance), `RedemptionService` (requires `Rider.kind = REGISTERED`, enforced as a domain invariant, not just a UI gate).
+- **Domain Services:** `RewardRuleEngine` (points-per-verified-trip, configurable, possibly tiered by trust score/distance), `RedemptionService` (requires `Rider.kind = REGISTERED`, enforced as a domain invariant, not just a UI gate; redemption transaction recomputes and validates balance non-negativity per ADR-0016, not a read-then-write across two statements).
 - **Domain Events:** `PointsEarned`, `PointsRedeemed`
 
 ## 6. Advertising Context
@@ -107,6 +109,7 @@ flowchart LR
   - `status`: `DRAFT | ACTIVE | PAUSED | EXHAUSTED | ENDED`
 - **Entities:** `Merchant { merchantId, name, cityId, category }`, `Impression { campaignId, riderRef, tripId?, servedAt, context }`, `Click { impressionId, clickedAt }`
 - **Domain Services:** `CampaignTargetingEngine` (evaluates active campaigns against a trip's origin/destination/route/live-position and returns priority-ranked matches), `BudgetEnforcementService`
+- **V1 simplification (added on architecture review, ADR-0014):** `priority`/`budget` pacing exist in the schema from day one, but MVP's `CampaignTargetingEngine` implementation only needs to return the single best-matching active campaign (ties broken by creation order) — full priority-weighted, budget-paced arbitration is deferred until real merchant volume creates genuine overlapping-targeting competition. Evaluation is triggered at trip-lifecycle moments (start, ~60–90s/displacement intervals, completion), never per raw GPS ping, and is pre-filtered by a coarse spatial bucket before precise PostGIS containment.
 - **Domain Events:** `AdImpressionRecorded`, `AdClicked`, `CampaignBudgetExhausted`
 
 ## 7. Configuration Context

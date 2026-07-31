@@ -68,7 +68,8 @@ flowchart TD
 ## 7. Core Features (Phase-1 scope reference)
 
 ### 7.1 Fare Estimation
-- Inputs: origin, destination, computed distance, estimated travel time, traffic conditions, configurable fare-rule set (base fare, per-km rate, time-of-day multipliers, waiting charges).
+- Inputs: origin, destination, computed distance, estimated travel time, a time-of-day/day-of-week traffic profile (static, rule-configured — see ADR-0012), configurable fare-rule set (base fare, per-km rate, time-of-day multipliers, waiting charges).
+- **Scope note (added on architecture review, ADR-0012):** MVP models traffic through configurable time-of-day multipliers, not live/real-time traffic data — this is an explicit, named `TrafficProvider` port with a static adapter at MVP (Architecture §4), so future live-traffic responsiveness is an adapter addition, not a redesign. Live-traffic-responsive estimation is a post-MVP enhancement, not a Phase 5 deliverable.
 - Output: an **estimated fare range** (min–max), not a single number, reflecting negotiation variance in traditional taxis.
 - Fare rules are configuration, not code — editable by admins without a deploy.
 

@@ -19,6 +19,8 @@
 |---|---|---|
 | GPS spoofing (mock-location apps, hardware spoofers) to fake a trip and farm rewards | Corrupts trip dataset; steals reward value | Trust Engine GPS-spoofing signal (mock-location OS flags where detectable, implausible signal-quality patterns, sensor-fusion cross-checks vs. accelerometer where available); trips below threshold never reward |
 | Fake/duplicate rider identities (device farms) to farm guest rewards | Reward abuse at scale | Device-level rate limiting, trust scoring at the rider level (aggregate abuse pattern detection), CAPTCHA/attestation on suspicious volume (Play Integrity API / App Attest) |
+| **(added on architecture review)** Single-device reinstall resets guest-identity reward-eligibility history, enabling repeated farming from one physical device without needing a device farm | Reward abuse, degraded data quality | Accepted MVP risk (Security Model §4): capped early reward value + abuse-rate monitoring; hardware attestation (Play Integrity/App Attest) gating guest reward accrual is a named Phase 6+ item if abuse data justifies it — see ADR-0009 |
+| **(added on architecture review)** Registration-time account-merge injection: a device farm reachable to one real verified phone/Google/Apple identity attempts to inject fabricated guest trip/reward history into that unrelated account via the promotion path | Cross-account reward/data fraud | Guest-history merge only occurs when the device's own local rider is still `GUEST` at registration time; if the identity already belongs to a different `REGISTERED` rider, no merge happens (ADR-0009) |
 | Impersonating another rider's session (token theft) | Account/points theft | Short-lived JWTs, refresh-token rotation with reuse detection, secure token storage on device |
 
 ### Tampering
@@ -26,6 +28,7 @@
 | Threat | Impact | Mitigation |
 |---|---|---|
 | Client submits manipulated GPS pings or a fabricated route to shape trust scoring | Fraudulent trip verification | All fare/trust-relevant values computed server-side from raw pings; pings are append-only and immutable once written; server independently computes distance/route via RoutingProvider, compared against client-reported track |
+| **(added on architecture review)** Client misreports GPS `recorded_at` timestamps to manipulate speed/plausibility signals (client clock is not a trusted source) | Fraudulent trip verification via manipulated speed/duration signals | Server stamps `received_at` on every ping at ingestion (ADR-0015); large divergence between client-claimed and server-observed timing deltas is itself a Trust Engine input, not silently trusted |
 | Client submits a fabricated `actualFare` to farm reward tiers (if reward scales with fare) | Reward abuse | Fare-plausibility trust signal (compare actual fare against estimated range + city fare-rule bounds); anomalies flagged, not auto-rejected, to avoid false positives on legitimate negotiation variance |
 | Admin audit log tampering | Loss of accountability | Audit log is append-only at the DB-role level (no UPDATE/DELETE grant to app runtime role) |
 
