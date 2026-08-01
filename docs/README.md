@@ -1,6 +1,6 @@
 # Taxi Alexandria Platform — Documentation
 
-This directory contains the Phase 1 (Research & Architecture) deliverables for the Taxi Alexandria Platform, as defined by the project's master prompt, extended with four mandatory platforms (Data Quality, Feature Management, Configuration, Fare Policy Engine), and hardened through a final Pre-Implementation Architecture Audit. **Phase 2 is authorized** (audit score 95.4/100 — see item 20 below). No application code existed prior to that authorization.
+This directory contains the Phase 1 (Research & Architecture) deliverables for the Taxi Alexandria Platform, as defined by the project's master prompt, extended with four mandatory platforms (Data Quality, Feature Management, Configuration, Fare Policy Engine), and hardened through a final Pre-Implementation Architecture Audit. **Phase 2 (Project Foundation) is complete** — see item 22 below for the audit that verifies it. **Phase 3 does not begin automatically**; it starts only on explicit instruction.
 
 ## Reading Order
 
@@ -25,6 +25,7 @@ This directory contains the Phase 1 (Research & Architecture) deliverables for t
 19. [Platform Extensions](18-platform-extensions.md) — Data Quality, Feature Management, Configuration Platform, and Fare Policy Engine design (mandatory additions, added before Phase 2)
 20. [Pre-Implementation Architecture Audit](19-pre-implementation-audit.md) — the final gate before Phase 2: first-principles audit across 9 categories, Critical/Medium/Minor findings, Technical Debt Forecast, and the Go/No-Go decision (95.4/100 — **Phase 2 authorized**)
 21. [Change Control Policy & Phase Definition of Done](20-change-control-and-definition-of-done.md) — **effective from Phase 2**: the architecture is frozen; any change requires an ADR + justification + impact analysis + migration strategy; every phase must clear a Definition of Done gate before the next begins. See also `/CLAUDE.md` at the repo root for the always-loaded summary.
+22. [Phase 2 Foundation Audit](21-phase2-foundation-audit.md) — verifies every Phase 2 deliverable (monorepo, CI/CD, shared packages, configuration platform, logging/monitoring/security foundations, testing infrastructure, migration framework) against the frozen architecture and the Definition of Done. **Phase 2 is complete; Phase 3 does not start automatically.**
 
 ## Architecture Decision Records
 
@@ -73,7 +74,7 @@ Identity, Trip, **Fare Policy** *(new)*, Trust, Reward, Advertising, **Data Qual
 
 All documents are living documents, now through three revision passes (the Architecture Review, the Platform Extensions revision, and the Pre-Implementation Architecture Audit) — the Roadmap (§"Roadmap Governance") mandates a review pass at the end of every subsequent phase, updating documents to reflect as-built reality where implementation reveals a better approach (per the project's engineering principle: "whenever you discover a better architectural solution, stop, refactor the architecture if necessary, then continue").
 
-**Phase 2 (Project Foundation) is authorized** as of the Pre-Implementation Architecture Audit's 95.4/100 re-score. See `19-pre-implementation-audit.md` for the full reasoning, the nine Critical findings that were closed to reach that score, and the remaining tracked-but-not-blocking items carried into the Roadmap's Post-MVP Horizon.
+**Phase 2 (Project Foundation) is complete**, authorized as of the Pre-Implementation Architecture Audit's 95.4/100 re-score (`19-pre-implementation-audit.md`) and verified against the Definition of Done in `21-phase2-foundation-audit.md`. **Phase 3 does not begin automatically** — it starts only on a separate, explicit instruction.
 
 ## Architecture Freeze (effective from Phase 2)
 

@@ -1,0 +1,5 @@
+# Monitoring & Observability
+
+- `health.module.ts` / `health.controller.ts` — `/admin/system/health` (API Specification §7), currently checking database connectivity via Terminus. Redis and per-module business-health checks are added as those modules are built.
+- `metrics.module.ts` / `metrics.controller.ts` — `/metrics` Prometheus exposition (default Node process metrics registered on boot; module-specific counters/histograms register against the same default registry as each module is built).
+- `tracing.bootstrap.ts` — OpenTelemetry SDK bootstrap (ADR-0027). Only activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set — there is no tracing backend available in every environment (see `docs/21-phase2-foundation-audit.md` for this build's specifics), and the bootstrap is a no-op rather than failing or emitting connection-refused noise when one isn't configured. Must be imported at the very top of `main.ts`, before any other module, so auto-instrumentation can patch Node's built-in modules before they're first required.

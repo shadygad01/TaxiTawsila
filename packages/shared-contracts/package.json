@@ -1,0 +1,21 @@
+{
+  "name": "@taxitawsila/shared-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared kernel types (Domain Model §12): Provenance, event envelope, Result convention, and other cross-context primitives. No business logic — types only.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.0"
+  }
+}

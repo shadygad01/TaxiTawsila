@@ -20,6 +20,7 @@ This roadmap maps the 10 development phases defined in the project's master prom
 - CI/CD pipelines (lint, test, build) per Deployment Strategy §3.
 - Formatting/linting configs (Coding Standards) enforced from the first commit.
 - **Exit criteria:** empty apps build, lint, and deploy to staging successfully; CI green on a trivial PR.
+- **As delivered (see `21-phase2-foundation-audit.md`):** the above, plus a broader engineering-foundation scope requested before this phase's implementation began — a working Configuration Platform framework (generic `VersionedConfigService<T>`, dual-control state machine), the transactional outbox with dead-letter handling, logging/correlation-ID/monitoring/tracing bootstraps, a JWT + RBAC + distributed rate-limiting security foundation, and the full database migration framework (all 10 schemas + platform schema). No fare/trip/maps/GPS/tracking/reward/advertising business logic was implemented, per that instruction's explicit exclusion list. **Phase 2 is complete; Phase 3 does not start automatically.**
 
 ## Phase 3 — Core Platform
 

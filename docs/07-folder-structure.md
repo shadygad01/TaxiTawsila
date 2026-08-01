@@ -1,6 +1,6 @@
 # Folder Structure
 
-**Status:** Draft v1.0 — Phase 1
+**Status:** v1.1 — aligned with the Domain Model's 10 bounded contexts (Phase 2 scaffolding correction; this is a documentation-drift fix, not a new architectural decision — `farepolicy`, `dataquality`, and `feature` were added as bounded contexts by the Platform Extensions revision and Database Schema §1 already lists 10 schemas, but this document was never mechanically updated to match. See `20-change-control-and-definition-of-done.md` — correcting a stale cross-reference between already-approved documents does not itself require a fresh ADR.)
 
 ## 1. Monorepo Layout
 
@@ -51,6 +51,7 @@ apps/backend/
 │   │   │   ├── application/
 │   │   │   ├── infrastructure/
 │   │   │   └── interface/
+│   │   ├── farepolicy/                # Fare Policy Context (ADR-0021) — added, was missing from v1.0
 │   │   ├── trust/
 │   │   │   ├── domain/                # TrustScoringEngine + TrustSignalEvaluator[] (pure, unit-tested heavily)
 │   │   │   ├── application/
@@ -58,7 +59,9 @@ apps/backend/
 │   │   │   └── interface/
 │   │   ├── reward/
 │   │   ├── advertising/
+│   │   ├── dataquality/               # Data Quality Context (ADR-0019/0020) — added, was missing from v1.0
 │   │   ├── configuration/
+│   │   ├── feature/                   # Feature Management Context (ADR-0018) — added, was missing from v1.0
 │   │   └── admin/
 │   ├── platform/
 │   │   ├── maps/                     # MapProvider/RoutingProvider/GeocodingProvider ports + adapters

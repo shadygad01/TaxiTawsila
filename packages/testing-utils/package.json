@@ -1,0 +1,22 @@
+{
+  "name": "@taxitawsila/testing-utils",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared test fixtures/builders (Folder Structure §5) usable across apps' test suites — e.g. a live-Postgres test-database helper, so integration tests don't each reimplement connection setup/teardown.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "echo 'testing-utils is exercised indirectly via consumers integration tests'"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/pg": "^8.11.10",
+    "@types/node": "^22.10.0"
+  }
+}

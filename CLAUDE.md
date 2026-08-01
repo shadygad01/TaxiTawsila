@@ -6,7 +6,7 @@ A passenger-only fare-estimation, live-tracking, and transportation-intelligence
 
 ## Current status
 
-**Phase 1 (Research & Architecture) is complete and the architecture is frozen.** Phase 2 (Project Foundation / implementation) is authorized as of `docs/19-pre-implementation-audit.md` (95.4/100). Start at `docs/README.md` for the full document index — read it before touching anything else in this repo.
+**Phase 1 (Research & Architecture) is complete and the architecture is frozen. Phase 2 (Project Foundation) is complete** — verified against the Definition of Done in `docs/21-phase2-foundation-audit.md`. **Phase 3 does not begin automatically**; it starts only on a separate, explicit instruction. Start at `docs/README.md` for the full document index — read it before touching anything else in this repo.
 
 ## Architecture is frozen — this is not optional guidance
 

@@ -1,0 +1,33 @@
+{
+  "name": "@taxitawsila/admin-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "React admin dashboard (Folder Structure §4). Phase 2 scope: app shell + system health page only — no business features (users, trips, rewards, merchants, campaigns) per docs/21-phase2-foundation-audit.md.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "@tanstack/react-query": "^5.62.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.3",
+    "typescript": "^5.7.0",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "vitest": "^2.1.8",
+    "@testing-library/react": "^16.1.0",
+    "jsdom": "^25.0.1",
+    "eslint": "^9.15.0",
+    "eslint-plugin-react": "^7.37.2",
+    "eslint-plugin-react-hooks": "^5.0.0"
+  }
+}

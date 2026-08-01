@@ -1,0 +1,5 @@
+include: package:flutter_lints/flutter.yaml
+
+# Coding Standards §4: strict flutter_lints ruleset, dart format enforced
+# pre-commit. No project-specific rule relaxations at Phase 2 — there is no
+# business code yet to justify any exception.
