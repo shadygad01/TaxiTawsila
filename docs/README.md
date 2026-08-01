@@ -24,6 +24,7 @@ This directory contains the Phase 1 (Research & Architecture) deliverables for t
 18. [Architecture Improvement Report](17-architecture-improvements.md) — prioritized action list derived from the review
 19. [Platform Extensions](18-platform-extensions.md) — Data Quality, Feature Management, Configuration Platform, and Fare Policy Engine design (mandatory additions, added before Phase 2)
 20. [Pre-Implementation Architecture Audit](19-pre-implementation-audit.md) — the final gate before Phase 2: first-principles audit across 9 categories, Critical/Medium/Minor findings, Technical Debt Forecast, and the Go/No-Go decision (95.4/100 — **Phase 2 authorized**)
+21. [Change Control Policy & Phase Definition of Done](20-change-control-and-definition-of-done.md) — **effective from Phase 2**: the architecture is frozen; any change requires an ADR + justification + impact analysis + migration strategy; every phase must clear a Definition of Done gate before the next begins. See also `/CLAUDE.md` at the repo root for the always-loaded summary.
 
 ## Architecture Decision Records
 
@@ -73,3 +74,7 @@ Identity, Trip, **Fare Policy** *(new)*, Trust, Reward, Advertising, **Data Qual
 All documents are living documents, now through three revision passes (the Architecture Review, the Platform Extensions revision, and the Pre-Implementation Architecture Audit) — the Roadmap (§"Roadmap Governance") mandates a review pass at the end of every subsequent phase, updating documents to reflect as-built reality where implementation reveals a better approach (per the project's engineering principle: "whenever you discover a better architectural solution, stop, refactor the architecture if necessary, then continue").
 
 **Phase 2 (Project Foundation) is authorized** as of the Pre-Implementation Architecture Audit's 95.4/100 re-score. See `19-pre-implementation-audit.md` for the full reasoning, the nine Critical findings that were closed to reach that score, and the remaining tracked-but-not-blocking items carried into the Roadmap's Post-MVP Horizon.
+
+## Architecture Freeze (effective from Phase 2)
+
+**The architecture is now frozen.** No further architectural changes may be made as an implementation shortcut. Any change to the frozen design requires, before implementation proceeds: a written ADR, a documented justification, an impact analysis, and a migration strategy — see `20-change-control-and-definition-of-done.md`. Every phase must additionally clear a Definition of Done gate (architecture validation, tests passing, docs updated, zero known critical bugs, zero duplicated business logic, no TODOs, no temporary implementations, no commented-out production code) before the next phase begins. The repo-root `CLAUDE.md` carries the always-loaded summary of this policy for any future working session.
